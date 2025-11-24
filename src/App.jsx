@@ -1,8 +1,91 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
+import Editor from 'react-simple-code-editor'
+import { highlight, languages } from 'prismjs'
+import 'prismjs/components/prism-javascript'
+import 'prismjs/components/prism-json'
+import 'prismjs/components/prism-markdown'
+import 'prismjs/components/prism-css'
+import 'prismjs/components/prism-markup'
+import 'prismjs/themes/prism-tomorrow.css'
 import './App.css'
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? 'http://localhost:4000'
+const SESSION_STORAGE_KEY = 'toolzbuy:activeSession'
+const CLIENT_ID_STORAGE_KEY = 'toolzbuy:clientId'
+const DISPLAY_NAME_STORAGE_KEY = 'toolzbuy:displayName'
+
+const generateClientId = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID()
+  }
+  return Math.random().toString(36).slice(2, 12)
+}
+
+const safeLocalStorage = () => {
+  if (typeof window === 'undefined') return null
+  try {
+    return window.localStorage
+  } catch {
+    return null
+  }
+}
+
+const getStoredClientId = () => {
+  const storage = safeLocalStorage()
+  if (!storage) {
+    return generateClientId()
+  }
+  const existing = storage.getItem(CLIENT_ID_STORAGE_KEY)
+  if (existing) {
+    return existing
+  }
+  const next = generateClientId()
+  storage.setItem(CLIENT_ID_STORAGE_KEY, next)
+  return next
+}
+
+const getStoredDisplayName = () => {
+  const storage = safeLocalStorage()
+  if (!storage) return ''
+  return storage.getItem(DISPLAY_NAME_STORAGE_KEY) ?? ''
+}
+
+const saveDisplayName = (value) => {
+  const storage = safeLocalStorage()
+  if (!storage) return
+  storage.setItem(DISPLAY_NAME_STORAGE_KEY, value ?? '')
+}
+
+const saveSessionMetadata = (code, role = 'guest') => {
+  const storage = safeLocalStorage()
+  if (!storage || !code) return
+  storage.setItem(
+    SESSION_STORAGE_KEY,
+    JSON.stringify({
+      code,
+      role,
+      updatedAt: Date.now(),
+    })
+  )
+}
+
+const loadSessionMetadata = () => {
+  const storage = safeLocalStorage()
+  if (!storage) return null
+  try {
+    const raw = storage.getItem(SESSION_STORAGE_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+const clearSessionMetadata = () => {
+  const storage = safeLocalStorage()
+  if (!storage) return
+  storage.removeItem(SESSION_STORAGE_KEY)
+}
 
 let socketInstance
 
@@ -10,21 +93,75 @@ const getSocket = () => {
   if (!socketInstance) {
     socketInstance = io(SOCKET_URL, {
       autoConnect: false,
+      auth: {
+        clientId: getStoredClientId(),
+      },
     })
   }
   return socketInstance
 }
 
 function App() {
+  const initialSession = useMemo(() => loadSessionMetadata(), [])
   const [content, setContent] = useState('')
-  const [status, setStatus] = useState('Connecting…')
+  const [status, setStatus] = useState(
+    initialSession?.role === 'creator'
+      ? 'Waiting for another user...'
+      : 'Connecting…'
+  )
   const [remoteTyping, setRemoteTyping] = useState(false)
-  const [connectionCode, setConnectionCode] = useState('')
+  const [connectionCode, setConnectionCode] = useState(
+    () => initialSession?.code || ''
+  )
   const [inputCode, setInputCode] = useState('')
   const [showTypingPad, setShowTypingPad] = useState(false)
   const [codeLength, setCodeLength] = useState(6)
+  const [codeBlocks, setCodeBlocks] = useState([{ id: 0, content: '', name: 'Block 1' }])
+  const [showShareDropdown, setShowShareDropdown] = useState(
+    () => Boolean(initialSession?.code && initialSession.role === 'creator')
+  )
+  const [connectedUsers, setConnectedUsers] = useState([])
+  const [displayName, setDisplayName] = useState(() => getStoredDisplayName() || '')
+  const [pendingName, setPendingName] = useState(() =>
+    initialSession?.role === 'creator' ? getStoredDisplayName() || '' : ''
+  )
+  const [selfSocketId, setSelfSocketId] = useState('')
+  const [isSavingName, setIsSavingName] = useState(false)
+  const [isDisconnecting, setIsDisconnecting] = useState(false)
+  const clientIdRef = useRef(getStoredClientId())
+  const shareDropdownRef = useRef()
   const typingTimeoutRef = useRef()
   const localTypingRef = useRef(false)
+
+  const updateParticipants = useCallback(
+    (participants) => {
+      if (!Array.isArray(participants)) {
+        setConnectedUsers([])
+        return
+      }
+      setConnectedUsers(participants)
+      const me = participants.find(
+        (entry) => entry.clientId === clientIdRef.current
+      )
+      if (me?.socketId) {
+        setSelfSocketId(me.socketId)
+      }
+      if (me?.name) {
+        setDisplayName(me.name)
+      }
+    },
+    []
+  )
+
+  const openShareDropdown = useCallback(() => {
+    setShowShareDropdown(true)
+    setPendingName((prev) => (prev ? prev : displayName || ''))
+  }, [displayName])
+
+  const closeShareDropdown = useCallback(() => {
+    setShowShareDropdown(false)
+    setPendingName('')
+  }, [])
 
   useEffect(() => {
     const client = getSocket()
@@ -34,10 +171,26 @@ function App() {
 
     const handleConnect = () => {
       setStatus('Connected')
+      setSelfSocketId(client.id || '')
     }
     const handleDisconnect = () => setStatus('Reconnecting…')
     const handleSync = (nextValue) => {
       setContent((prev) => (prev === nextValue ? prev : nextValue))
+      // Parse content into blocks when syncing
+      if (nextValue) {
+        const blocks = nextValue.split('\n\n---\n\n').filter(b => b.trim() !== '')
+        if (blocks.length > 0) {
+          setCodeBlocks(blocks.map((block, idx) => ({ 
+            id: idx, 
+            content: block.trim(),
+            name: `Block ${idx + 1}`
+          })))
+        } else {
+          setCodeBlocks([{ id: 0, content: nextValue, name: 'Block 1' }])
+        }
+      } else {
+        setCodeBlocks([{ id: 0, content: '', name: 'Block 1' }])
+      }
     }
     const handleTyping = (flag) => setRemoteTyping(Boolean(flag))
     const handleJoinSuccess = (code) => {
@@ -55,22 +208,60 @@ function App() {
     }
     const handleUserJoined = (data) => {
       console.log('user:joined event received:', data)
-      if (data && data.roomSize) {
-        // Show typing pad when someone else joins (roomSize > 1)
-        // This works for both creator and joiner
-        if (data.roomSize > 1) {
-          console.log('Showing typing pad, roomSize:', data.roomSize)
-          setShowTypingPad(true)
-          setStatus('Connected')
-          // Also ensure connection code is set if not already
-          if (data.code) {
-            setConnectionCode((prevCode) => {
-              const newCode = prevCode || data.code
-              console.log('Setting connection code:', newCode)
-              return newCode
-            })
-          }
+      // Only show typing pad when BOTH users are connected (roomSize >= 2)
+      if (data && data.roomSize && data.roomSize >= 2 && data.showPad) {
+        console.log('Both users connected! Showing typing pad, roomSize:', data.roomSize)
+        setShowTypingPad(true)
+        closeShareDropdown()
+        setStatus('Connected')
+        if (data.participants) {
+          updateParticipants(data.participants)
         }
+        // Also ensure connection code is set if not already
+        if (data.code) {
+          setConnectionCode((prevCode) => {
+            const newCode = prevCode || data.code
+            console.log('Setting connection code:', newCode)
+            return newCode
+          })
+        }
+      }
+    }
+    const handleSessionCreated = (data) => {
+      console.log('session:created event received:', data)
+      // Creator ko code dikhao but typing pad nahi (wait for user to join)
+      if (data && data.code) {
+        setConnectionCode(data.code)
+        setStatus('Waiting for user to join...')
+        openShareDropdown()
+        saveSessionMetadata(data.code, 'creator')
+        if (data.participants) {
+          updateParticipants(data.participants)
+        }
+        // Don't show typing pad yet - wait for both users
+      }
+    }
+    const handleWaitingForUser = (data) => {
+      console.log('waiting:for:user event received:', data)
+      // User joined but only one user, so don't show pad yet
+      if (data && data.code) {
+        setConnectionCode(data.code)
+        setStatus('Waiting for another user...')
+        openShareDropdown()
+        if (data.participants) {
+          updateParticipants(data.participants)
+        }
+      }
+    }
+    const handleParticipantsUpdate = (payload) => {
+      updateParticipants(payload?.participants)
+    }
+    const handleSelfInfo = (payload) => {
+      if (payload?.socketId) {
+        setSelfSocketId(payload.socketId)
+      }
+      if (payload?.name) {
+        setDisplayName(payload.name)
       }
     }
 
@@ -82,6 +273,10 @@ function App() {
     client.on('join:error', handleJoinError)
     client.on('code:config', handleCodeConfig)
     client.on('user:joined', handleUserJoined)
+    client.on('session:created', handleSessionCreated)
+    client.on('waiting:for:user', handleWaitingForUser)
+    client.on('participants:update', handleParticipantsUpdate)
+    client.on('self:info', handleSelfInfo)
 
     return () => {
       client.off('connect', handleConnect)
@@ -92,8 +287,12 @@ function App() {
       client.off('join:error', handleJoinError)
       client.off('code:config', handleCodeConfig)
       client.off('user:joined', handleUserJoined)
+      client.off('session:created', handleSessionCreated)
+      client.off('waiting:for:user', handleWaitingForUser)
+      client.off('participants:update', handleParticipantsUpdate)
+      client.off('self:info', handleSelfInfo)
     }
-  }, [])
+  }, [updateParticipants, openShareDropdown, closeShareDropdown])
 
   useEffect(() => {
     return () => {
@@ -103,6 +302,16 @@ function App() {
     }
   }, [])
 
+  useEffect(() => {
+    saveDisplayName(displayName || '')
+    const client = getSocket()
+    client.auth = {
+      ...(client.auth || {}),
+      clientId: clientIdRef.current,
+      name: displayName || '',
+    }
+  }, [displayName])
+  
   const notifyTyping = () => {
     const client = getSocket()
     if (!localTypingRef.current) {
@@ -120,12 +329,155 @@ function App() {
     }, 1200)
   }
 
-  const handleContentChange = (event) => {
-    const nextValue = event.target.value
-    setContent(nextValue)
-    getSocket().emit('content:update', nextValue)
+  const joinSessionWithCode = useCallback(
+    (
+      rawCode,
+      {
+        persistRole = 'guest',
+        showPadOnJoin = true,
+        statusMessage = 'Joining session...',
+        silent = false,
+      } = {}
+    ) => {
+      const normalized = (rawCode || '').toUpperCase().trim()
+      if (normalized.length !== codeLength) {
+        if (!silent) {
+          setStatus(`Connection code must be ${codeLength} characters`)
+        }
+        return
+      }
+
+      const client = getSocket()
+      client.auth = {
+        ...(client.auth || {}),
+        clientId: clientIdRef.current,
+        name: displayName || '',
+      }
+
+      if (!silent) {
+        setStatus(statusMessage)
+      }
+
+      const handleJoinComplete = (joinedCode) => {
+        setConnectionCode(joinedCode)
+        if (showPadOnJoin) {
+          setShowTypingPad(true)
+          closeShareDropdown()
+        }
+        setStatus('Connected')
+        saveSessionMetadata(joinedCode, persistRole)
+        client.off('join:success', handleJoinComplete)
+      }
+
+      client.once('join:success', handleJoinComplete)
+
+      const emitJoin = () => client.emit('join:session', normalized)
+      if (client.connected) {
+        emitJoin()
+      } else {
+        client.connect()
+        client.once('connect', emitJoin)
+      }
+    },
+    [codeLength, closeShareDropdown, displayName]
+  )
+
+  useEffect(() => {
+    const saved = initialSession
+    if (saved?.code) {
+      const timer = setTimeout(() => {
+        joinSessionWithCode(saved.code, {
+          persistRole: saved.role || 'guest',
+          showPadOnJoin: saved.role !== 'creator',
+          statusMessage: 'Reconnecting…',
+        })
+      }, 0)
+      return () => clearTimeout(timer)
+    }
+    return undefined
+  }, [initialSession, joinSessionWithCode])
+
+  const handleNameSave = () => {
+    const baseValue = pendingName !== '' ? pendingName : displayName
+    const trimmed = (baseValue || '').trim()
+    if (!trimmed) {
+      setStatus('Name cannot be empty')
+      return
+    }
+    if (trimmed.length < 2) {
+      setStatus('Name must be at least 2 characters')
+      return
+    }
+    if (trimmed === displayName) {
+      setPendingName('')
+      return
+    }
+    setIsSavingName(true)
+    const client = getSocket()
+    client.emit('user:updateName', trimmed, (response) => {
+      setIsSavingName(false)
+      if (response?.ok) {
+        setDisplayName(response.name || trimmed)
+        setPendingName('')
+        setStatus('Name updated')
+      } else {
+        setStatus(response?.error || 'Unable to update name')
+      }
+    })
+  }
+
+  const handleNameInputKeyDown = (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      handleNameSave()
+    }
+  }
+
+  const handleAddNewBlock = () => {
+    const newBlock = { id: codeBlocks.length, content: '', name: `Block ${codeBlocks.length + 1}` }
+    setCodeBlocks([...codeBlocks, newBlock])
+  }
+
+  const handleBlockChange = (blockId, newContent) => {
+    const updated = codeBlocks.map(block => 
+      block.id === blockId ? { ...block, content: newContent } : block
+    )
+    setCodeBlocks(updated)
+    
+    // Update main content by joining all blocks
+    const allContent = updated.map(b => b.content).join('\n\n---\n\n')
+    setContent(allContent)
+    getSocket().emit('content:update', allContent)
     notifyTyping()
   }
+
+  const handleCopyBlock = (blockContent) => {
+    navigator.clipboard.writeText(blockContent)
+    setStatus('Block copied!')
+    setTimeout(() => setStatus('Connected'), 2000)
+  }
+
+  const handleDeleteBlock = (blockId) => {
+    if (codeBlocks.length > 1) {
+      const updated = codeBlocks.filter(block => block.id !== blockId)
+      // Reassign IDs and names
+      const reindexed = updated.map((block, idx) => ({ ...block, id: idx, name: `Block ${idx + 1}` }))
+      setCodeBlocks(reindexed)
+      
+      // Update main content
+      const allContent = reindexed.map(b => b.content).join('\n\n---\n\n')
+      setContent(allContent)
+      getSocket().emit('content:update', allContent)
+    }
+  }
+
+  const handleRenameBlock = (blockId, newName) => {
+    const updated = codeBlocks.map(block => 
+      block.id === blockId ? { ...block, name: newName || `Block ${blockId + 1}` } : block
+    )
+    setCodeBlocks(updated)
+  }
+
 
   const handleCreateSession = () => {
     const client = getSocket()
@@ -135,8 +487,9 @@ function App() {
     const handleSessionCreated = (code) => {
       if (code) {
         setConnectionCode(code)
-        setStatus('Connected')
-        // Keep code input visible, don't switch to typing pad yet
+        setStatus('Waiting for another user...')
+        setShowTypingPad(false)
+        openShareDropdown()
       }
       // Remove this one-time listener
       client.off('join:success', handleSessionCreated)
@@ -162,33 +515,11 @@ function App() {
   }
 
   const handleJoinSession = () => {
-    const code = inputCode.toUpperCase().trim()
-    if (code.length !== codeLength) {
-      setStatus(`Connection code must be ${codeLength} characters`)
-      return
-    }
-    const client = getSocket()
-    setStatus('Joining session...')
-    
-    // Handler for when join is successful
-    const handleJoinComplete = (joinedCode) => {
-      setConnectionCode(joinedCode)
-      // When joining, show typing pad immediately since session exists
-      setShowTypingPad(true)
-      setStatus('Connected')
-      client.off('join:success', handleJoinComplete)
-    }
-    
-    client.once('join:success', handleJoinComplete)
-    
-    if (client.connected) {
-      client.emit('join:session', code)
-    } else {
-      client.connect()
-      client.once('connect', () => {
-        setTimeout(() => client.emit('join:session', code), 100)
-      })
-    }
+    joinSessionWithCode(inputCode, {
+      persistRole: 'guest',
+      showPadOnJoin: true,
+      statusMessage: 'Joining session...',
+    })
   }
 
   const handleCopyCode = () => {
@@ -196,6 +527,7 @@ function App() {
     setStatus('Code copied!')
     setTimeout(() => setStatus('Connected'), 2000)
   }
+
 
   const handleBack = () => {
     const client = getSocket()
@@ -207,17 +539,169 @@ function App() {
     setConnectionCode('')
     setInputCode('')
     setContent('')
+    setCodeBlocks([{ id: 0, content: '', name: 'Block 1' }])
     setShowTypingPad(false)
+    closeShareDropdown()
+    setConnectedUsers([])
+    clearSessionMetadata()
     setStatus('Connected')
+  }
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (
+        showShareDropdown &&
+        shareDropdownRef.current &&
+        !shareDropdownRef.current.contains(event.target)
+      ) {
+        closeShareDropdown()
+      }
+    }
+
+    if (showShareDropdown) {
+      document.addEventListener('mousedown', handleClickOutside)
+    }
+
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+    }
+  }, [showShareDropdown, closeShareDropdown])
+
+  const formatSocketId = (id) => {
+    if (!id) return ''
+    const safeId = String(id)
+    return safeId.length > 10 ? `${safeId.slice(0, 4)}…${safeId.slice(-4)}` : safeId
+  }
+
+  const nameInputValue =
+    pendingName !== '' ? pendingName : displayName || ''
+  const canSaveName =
+    nameInputValue.trim().length >= 2 &&
+    nameInputValue.trim() !== displayName
+  const isSaveDisabled = isSavingName || !canSaveName
+  const handleDisconnectClick = () => {
+    if (!connectionCode || isDisconnecting) return
+    setIsDisconnecting(true)
+    handleBack()
+    setIsDisconnecting(false)
   }
 
   return (
     <main className="app-shell">
+      {connectionCode && (
+        <div className="share-button-container" ref={shareDropdownRef}>
+          <button 
+            className="btn-share" 
+            onClick={() => (showShareDropdown ? closeShareDropdown() : openShareDropdown())}
+            title="Share connection code"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="18" cy="5" r="3"></circle>
+              <circle cx="6" cy="12" r="3"></circle>
+              <circle cx="18" cy="19" r="3"></circle>
+              <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"></line>
+              <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"></line>
+            </svg>
+            Share
+          </button>
+          {showShareDropdown && (
+            <div className="share-dropdown">
+              <div className="share-name-editor">
+                <div className="share-name-label">
+                  <span>Your name</span>
+                  <span className="share-name-hint">Visible to others</span>
+                </div>
+                <div className="share-name-input">
+                  <input
+                    type="text"
+                    value={nameInputValue}
+                    onChange={(e) => setPendingName(e.target.value)}
+                    onKeyDown={handleNameInputKeyDown}
+                    placeholder="Enter your name"
+                  />
+                  <button
+                    className="btn-save-name"
+                    onClick={handleNameSave}
+                    disabled={isSaveDisabled}
+                  >
+                    {isSavingName ? 'Saving…' : 'Save'}
+                  </button>
+                </div>
+              </div>
+              <div className="share-connections">
+                <div className="share-connections-header">
+                  <span>Connected people</span>
+                  <span className="share-connections-count">
+                    {connectedUsers.length}
+                  </span>
+                </div>
+                <div className="participant-list">
+                  {connectedUsers.length > 0 ? (
+                    connectedUsers.map((user, index) => {
+                      const socketId = user?.socketId
+                      const isSelf = socketId === selfSocketId
+                      const fallbackLabel = `User ${index + 1}`
+                      const displayLabel = user?.name || fallbackLabel
+                      return (
+                        <div
+                          key={socketId || `${fallbackLabel}-${index}`}
+                          className={`participant-pill ${isSelf ? 'participant-pill--self' : ''}`}
+                        >
+                          <div className="participant-name">
+                            {displayLabel}
+                            {isSelf && <span className="participant-self-tag">You</span>}
+                          </div>
+                          <span className="participant-id">
+                            {formatSocketId(socketId)}
+                          </span>
+                        </div>
+                      )
+                    })
+                  ) : (
+                    <div className="participant-pill participant-pill--empty">
+                      Only you are here right now
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="share-divider" />
+              <div className="share-code-wrapper">
+                <div className="share-code-label">Connection Code</div>
+                <div className="code-display">
+                  <span className="code-value">{connectionCode}</span>
+                  <button className="btn btn-copy" onClick={handleCopyCode}>
+                    Copy
+                  </button>
+                </div>
+              </div>
+              <div className="share-actions">
+                <button
+                  className="btn-disconnect"
+                  onClick={handleDisconnectClick}
+                  disabled={isDisconnecting}
+                >
+                  {isDisconnecting ? 'Disconnecting…' : 'Disconnect Session'}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {showTypingPad && (
+        <button className="btn-back-arrow-top-right" onClick={handleBack} title="Back to Create/Join Session">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M19 12H5M12 19l-7-7 7-7"/>
+          </svg>
+        </button>
+      )}
+
       <section className="pad-card">
         <header className="pad-header">
           <div>
             <p className="eyebrow">Shared paste pad</p>
-            <h1>Instant text sharing</h1>
+            <h1>Instant Text Sharing</h1>
           </div>
           <span className={`status-pill status-pill--${status === 'Connected' ? 'ok' : 'warn'}`}>
             {status}
@@ -238,16 +722,9 @@ function App() {
                 </button>
               ) : (
                 <div className="code-display-inline">
-                  <div className="code-display">
-                    <span className="code-value">{connectionCode}</span>
-                    <button className="btn btn-copy" onClick={handleCopyCode}>
-                      Copy
-                    </button>
-                  </div>
-                  <p className="waiting-text">Waiting for others to join...</p>
-                  <button className="btn btn-back" onClick={handleBack}>
-                    ← Back
-                  </button>
+                  <p className="waiting-text">
+                    Waiting for others to join… share the code using the button in the top-right corner.
+                  </p>
                 </div>
               )}
               {!connectionCode && (
@@ -269,29 +746,100 @@ function App() {
           </div>
         ) : (
           <>
-            <div className="connection-code-display">
-              <p className="subtitle">
-                Share this connection code with others to collaborate in real time.
-              </p>
-              <div className="code-display">
-                <span className="code-value">{connectionCode || 'Generating...'}</span>
-                {connectionCode && (
-                  <button className="btn btn-copy" onClick={handleCopyCode}>
-                    Copy
-                  </button>
-                )}
-              </div>
-              <button className="btn btn-back" onClick={handleBack}>
-                ← Back to Create/Join Session
+            <div className="code-blocks-container">
+              {codeBlocks.map((block, index) => (
+                <div key={block.id} className="code-block-wrapper">
+                  <div className="code-block-header">
+                    <input
+                      type="text"
+                      className="code-block-name-input"
+                      value={block.name}
+                      onChange={(e) => handleRenameBlock(block.id, e.target.value)}
+                      onBlur={(e) => {
+                        if (!e.target.value.trim()) {
+                          handleRenameBlock(block.id, `Block ${block.id + 1}`)
+                        }
+                      }}
+                      placeholder={`Block ${index + 1}`}
+                    />
+                    <div className="code-block-actions">
+                      <button 
+                        className="btn-copy-block" 
+                        onClick={() => handleCopyBlock(block.content)}
+                        title="Copy this block"
+                      >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                        </svg>
+                      </button>
+                      {codeBlocks.length > 1 && (
+                        <button 
+                          className="btn-delete-block" 
+                          onClick={() => handleDeleteBlock(block.id)}
+                          title="Delete this block"
+                        >
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <polyline points="3 6 5 6 21 6"></polyline>
+                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="code-block-content">
+                    <Editor
+                      value={block.content}
+                      onValueChange={(code) => handleBlockChange(block.id, code)}
+                      highlight={(code) => {
+                        try {
+                          if (code.includes('function') || code.includes('const') || code.includes('let') || code.includes('var') || code.includes('=>')) {
+                            return highlight(code, languages.javascript, 'javascript')
+                          }
+                          if (code.trim().startsWith('{') || code.trim().startsWith('[')) {
+                            try {
+                              JSON.parse(code)
+                              return highlight(code, languages.json, 'json')
+                            } catch {
+                              // Not valid JSON
+                            }
+                          }
+                          if (code.includes('{') && code.includes(':') && code.includes(';')) {
+                            return highlight(code, languages.css, 'css')
+                          }
+                          if (code.includes('#') || code.includes('*') || (code.includes('[') && code.includes(']('))) {
+                            return highlight(code, languages.markdown, 'markdown')
+                          }
+                          if (code.includes('<') && code.includes('>')) {
+                            return highlight(code, languages.markup, 'markup')
+                          }
+                          return highlight(code, languages.javascript, 'javascript')
+                        } catch {
+                          return highlight(code, languages.plaintext, 'plaintext')
+                        }
+                      }}
+                      padding={16}
+                      className="code-editor-block"
+                      placeholder={`Start typing in Block ${index + 1}...`}
+                      style={{
+                        fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace",
+                        fontSize: '1.05rem',
+                        lineHeight: '1.6',
+                        outline: 'none',
+                      }}
+                    />
+                  </div>
+                </div>
+              ))}
+              
+              <button className="btn-add-block" onClick={handleAddNewBlock}>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="12" y1="5" x2="12" y2="19"></line>
+                  <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+                Add New Block
               </button>
             </div>
-
-            <textarea
-              className="shared-input"
-              value={content}
-              placeholder="Start typing or paste something to broadcast it…"
-              onChange={handleContentChange}
-            />
 
             <footer className="pad-footer">
               <span>{content.length} characters</span>
