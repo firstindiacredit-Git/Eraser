@@ -66,23 +66,44 @@ io.on("connection", (socket) => {
       sessionContent.set(sessionCode, "");
     }
 
-    // Get room size to check if others are connected
-    const room = io.sockets.adapter.rooms.get(sessionCode);
-    const roomSize = room ? room.size : 0;
-
     // Send current room content to the new user
     socket.emit("content:sync", sessionContent.get(sessionCode));
     socket.emit("join:success", sessionCode);
 
-    // Notify ALL users in the room (including creator) that someone joined
-    // This ensures the creator also sees the typing pad when someone joins
-    if (roomSize > 1) {
-      // Emit to all sockets in the room, including the new joiner and creator
-      io.to(sessionCode).emit("user:joined", {
-        roomSize,
-        code: sessionCode,
-      });
-    }
+    // Get room size AFTER joining to ensure accurate count
+    // Use a small delay to ensure socket is fully joined in the room
+    setTimeout(() => {
+      const room = io.sockets.adapter.rooms.get(sessionCode);
+      const roomSize = room ? room.size : 0;
+
+      // Notify ALL users in the room (including creator) that someone joined
+      // This ensures the creator also sees the typing pad when someone joins
+      if (roomSize > 1) {
+        // Emit to ALL sockets in the room - both creator and joiner
+        io.to(sessionCode).emit("user:joined", {
+          roomSize,
+          code: sessionCode,
+        });
+
+        // Also explicitly notify each socket in the room individually
+        // This ensures creator definitely gets the event
+        const socketsInRoom = Array.from(room);
+        console.log(
+          `Room ${sessionCode} has ${roomSize} users, notifying all...`
+        );
+        socketsInRoom.forEach((socketId) => {
+          const socketInRoom = io.sockets.sockets.get(socketId);
+          if (socketInRoom) {
+            // Notify ALL sockets including creator and joiner
+            socketInRoom.emit("user:joined", {
+              roomSize,
+              code: sessionCode,
+            });
+            console.log(`Sent user:joined to socket ${socketId}`);
+          }
+        });
+      }
+    }, 150);
   });
 
   // Handle creating a new room

@@ -54,15 +54,21 @@ function App() {
       }
     }
     const handleUserJoined = (data) => {
+      console.log('user:joined event received:', data)
       if (data && data.roomSize) {
         // Show typing pad when someone else joins (roomSize > 1)
         // This works for both creator and joiner
         if (data.roomSize > 1) {
+          console.log('Showing typing pad, roomSize:', data.roomSize)
           setShowTypingPad(true)
           setStatus('Connected')
           // Also ensure connection code is set if not already
-          if (!connectionCode && data.code) {
-            setConnectionCode(data.code)
+          if (data.code) {
+            setConnectionCode((prevCode) => {
+              const newCode = prevCode || data.code
+              console.log('Setting connection code:', newCode)
+              return newCode
+            })
           }
         }
       }
