@@ -74,10 +74,14 @@ io.on("connection", (socket) => {
     socket.emit("content:sync", sessionContent.get(sessionCode));
     socket.emit("join:success", sessionCode);
 
-    // Notify other users in the room that someone joined
+    // Notify ALL users in the room (including creator) that someone joined
+    // This ensures the creator also sees the typing pad when someone joins
     if (roomSize > 1) {
-      socket.to(sessionCode).emit("user:joined", { roomSize });
-      socket.emit("user:joined", { roomSize });
+      // Emit to all sockets in the room, including the new joiner and creator
+      io.to(sessionCode).emit("user:joined", {
+        roomSize,
+        code: sessionCode,
+      });
     }
   });
 
@@ -97,7 +101,7 @@ io.on("connection", (socket) => {
 
     socket.emit("join:success", newCode);
     socket.emit("content:sync", "");
-    socket.emit("user:joined", { roomSize: 1 }); // Only creator for now
+    // Don't emit user:joined here - wait until someone actually joins
   });
 
   socket.on("content:update", (nextValue) => {
