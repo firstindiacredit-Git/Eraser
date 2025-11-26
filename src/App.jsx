@@ -140,6 +140,7 @@ function App() {
   const typingTimeoutRef = useRef()
   const localTypingRef = useRef(false)
   const createSessionFallbackRef = useRef()
+  const offlineRetryIntervalRef = useRef()
   const landingVideoRefs = useRef([])
   const [landingTypingIndex, setLandingTypingIndex] = useState(0)
   const [landingTypingText, setLandingTypingText] = useState('')
@@ -191,6 +192,13 @@ function App() {
     }
   }, [])
 
+  const clearOfflineRetryTimer = useCallback(() => {
+    if (offlineRetryIntervalRef.current) {
+      clearInterval(offlineRetryIntervalRef.current)
+      offlineRetryIntervalRef.current = null
+    }
+  }, [])
+
   const activateOfflineSession = useCallback(() => {
     const offlineCode = generateLocalConnectionCode()
     if (!offlineCode) {
@@ -200,7 +208,7 @@ function App() {
     setIsOfflineSession(true)
     setConnectionCode(offlineCode)
     setInputCode(offlineCode)
-    setStatus('Offline mode: share this code once the server reconnects.')
+    setStatus('Offline mode: sharing placeholder while auto-retrying…')
     setShowTypingPad(false)
     setConnectedUsers([])
     clearSessionMetadata()
@@ -414,8 +422,9 @@ function App() {
         clearTimeout(typingTimeoutRef.current)
       }
       clearCreateSessionFallback()
+      clearOfflineRetryTimer()
     }
-  }, [clearCreateSessionFallback])
+  }, [clearCreateSessionFallback, clearOfflineRetryTimer])
 
   useEffect(() => {
     saveDisplayName(displayName || '')
@@ -594,56 +603,64 @@ function App() {
     setCodeBlocks(updated)
   }
 
-  const handleCreateSession = () => {
-    const client = getSocket()
-    setIsOfflineSession(false)
-    setStatus('Creating session...')
-    clearCreateSessionFallback()
-    
-    // Handler to receive the connection code
-    const handleSessionCreated = (code) => {
-      clearCreateSessionFallback()
-      setIsOfflineSession(false)
-      if (code) {
-        setConnectionCode(code)
-        setInputCode(code)
-        setStatus('Waiting for another user...')
-        setShowTypingPad(false)
-        closeShareDropdown()
+  const handleCreateSession = useCallback(
+    (options = {}) => {
+      const { silentRetry = false } = options
+      const client = getSocket()
+      if (!silentRetry) {
+        setIsOfflineSession(false)
+        setStatus('Creating session...')
       }
-      // Remove this one-time listener
-      client.off('join:success', handleSessionCreated)
-    }
-    
-    // Set up listener for the response
-    client.once('join:success', handleSessionCreated)
-
-    createSessionFallbackRef.current = setTimeout(() => {
-      activateOfflineSession()
-      client.off('join:success', handleSessionCreated)
-      createSessionFallbackRef.current = null
-    }, 3000)
-    
-    // Ensure we're connected before creating session
-    if (client.connected) {
-      client.emit('create:session')
-    } else {
-      // Connect first, then create session
-      client.connect()
+      clearCreateSessionFallback()
       
-      // Wait for connection and create session
-      client.once('connect', () => {
-        setTimeout(() => {
-          client.emit('create:session')
-        }, 100)
-      })
-    }
-  }
+      // Handler to receive the connection code
+      const handleSessionCreated = (code) => {
+        clearCreateSessionFallback()
+        setIsOfflineSession(false)
+        if (code) {
+          setConnectionCode(code)
+          setInputCode(code)
+          setStatus('Waiting for another user...')
+          setShowTypingPad(false)
+          closeShareDropdown()
+        }
+        // Remove this one-time listener
+        client.off('join:success', handleSessionCreated)
+      }
+      
+      // Set up listener for the response
+      client.once('join:success', handleSessionCreated)
+
+      createSessionFallbackRef.current = setTimeout(() => {
+        if (!silentRetry) {
+          activateOfflineSession()
+        }
+        client.off('join:success', handleSessionCreated)
+        createSessionFallbackRef.current = null
+      }, silentRetry ? 2000 : 3000)
+      
+      // Ensure we're connected before creating session
+      if (client.connected) {
+        client.emit('create:session')
+      } else {
+        // Connect first, then create session
+        client.connect()
+        
+        // Wait for connection and create session
+        client.once('connect', () => {
+          setTimeout(() => {
+            client.emit('create:session')
+          }, 100)
+        })
+      }
+    },
+    [activateOfflineSession, clearCreateSessionFallback, closeShareDropdown]
+  )
 
   const handleRefreshConnectionCode = () => {
     const client = getSocket()
     if (isOfflineSession) {
-      activateOfflineSession()
+      handleCreateSession()
       return
     }
     if (!connectionCode) {
@@ -681,6 +698,21 @@ function App() {
     setTimeout(() => setStatus('Connected'), 2000)
   }
 
+  useEffect(() => {
+    if (!isOfflineSession) {
+      clearOfflineRetryTimer()
+      return
+    }
+    const attemptServerSession = () => {
+      handleCreateSession({ silentRetry: true })
+    }
+    attemptServerSession()
+    offlineRetryIntervalRef.current = setInterval(attemptServerSession, 2000)
+    return () => {
+      clearOfflineRetryTimer()
+    }
+  }, [isOfflineSession, handleCreateSession, clearOfflineRetryTimer])
+
 
   const handleBack = () => {
     const client = getSocket()
@@ -691,6 +723,7 @@ function App() {
     // Reset state
     setIsOfflineSession(false)
     clearCreateSessionFallback()
+    clearOfflineRetryTimer()
     setConnectionCode('')
     setInputCode('')
     setContent('')
