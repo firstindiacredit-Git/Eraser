@@ -14,6 +14,11 @@ const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? 'http://localhost:4000'
 const SESSION_STORAGE_KEY = 'toolzbuy:activeSession'
 const CLIENT_ID_STORAGE_KEY = 'toolzbuy:clientId'
 const DISPLAY_NAME_STORAGE_KEY = 'toolzbuy:displayName'
+const LANDING_TYPING_PHRASES = [
+  'Pair program from anywhere.',
+  'Ship reviews while you call.',
+  'Demo your fix in real time.',
+]
 
 const generateClientId = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -125,13 +130,17 @@ function App() {
   const [pendingName, setPendingName] = useState(() =>
     initialSession?.role === 'creator' ? getStoredDisplayName() || '' : ''
   )
-  const [selfSocketId, setSelfSocketId] = useState('')
   const [isSavingName, setIsSavingName] = useState(false)
   const [isDisconnecting, setIsDisconnecting] = useState(false)
-  const clientIdRef = useRef(getStoredClientId())
+  const [clientIdValue] = useState(() => getStoredClientId())
+  const clientIdRef = useRef(clientIdValue)
   const shareDropdownRef = useRef()
   const typingTimeoutRef = useRef()
   const localTypingRef = useRef(false)
+  const landingVideoRefs = useRef([])
+  const [landingTypingIndex, setLandingTypingIndex] = useState(0)
+  const [landingTypingText, setLandingTypingText] = useState('')
+  const [isDeletingLandingText, setIsDeletingLandingText] = useState(false)
 
   const updateParticipants = useCallback(
     (participants) => {
@@ -143,9 +152,6 @@ function App() {
       const me = participants.find(
         (entry) => entry.clientId === clientIdRef.current
       )
-      if (me?.socketId) {
-        setSelfSocketId(me.socketId)
-      }
       if (me?.name) {
         setDisplayName(me.name)
       }
@@ -164,6 +170,72 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (showTypingPad) {
+      return
+    }
+    let interactionHandler
+
+    const playAllVideos = () => {
+      landingVideoRefs.current.forEach((video) => {
+        if (!video) return
+        video.muted = true
+        video.playsInline = true
+        const playPromise = video.play()
+        if (playPromise?.catch) {
+          playPromise.catch(() => {
+            if (interactionHandler) return
+            interactionHandler = () => {
+              landingVideoRefs.current.forEach((vid) => {
+                if (vid) {
+                  vid.play().catch(() => {})
+                }
+              })
+            }
+            window.addEventListener('pointerdown', interactionHandler, { once: true })
+            window.addEventListener('keydown', interactionHandler, { once: true })
+          })
+        }
+      })
+    }
+
+    playAllVideos()
+
+    return () => {
+      if (interactionHandler) {
+        window.removeEventListener('pointerdown', interactionHandler)
+        window.removeEventListener('keydown', interactionHandler)
+      }
+    }
+  }, [showTypingPad])
+
+  useEffect(() => {
+    const phrasesCount = LANDING_TYPING_PHRASES.length
+    if (phrasesCount === 0) {
+      return
+    }
+    const activePhrase =
+      LANDING_TYPING_PHRASES[landingTypingIndex % phrasesCount] || ''
+    let timeoutId
+
+    if (!isDeletingLandingText && landingTypingText === activePhrase) {
+      timeoutId = setTimeout(() => setIsDeletingLandingText(true), 1500)
+    } else if (isDeletingLandingText && landingTypingText === '') {
+      timeoutId = setTimeout(() => {
+        setIsDeletingLandingText(false)
+        setLandingTypingIndex((prev) => (prev + 1) % phrasesCount)
+      }, 300)
+    } else {
+      const nextLength =
+        landingTypingText.length + (isDeletingLandingText ? -1 : 1)
+      timeoutId = setTimeout(() => {
+        setLandingTypingText(activePhrase.slice(0, Math.max(0, nextLength)))
+      }, isDeletingLandingText ? 45 : 120)
+    }
+
+    return () => clearTimeout(timeoutId)
+  }, [landingTypingIndex, landingTypingText, isDeletingLandingText])
+
+  useEffect(() => {
     const client = getSocket()
     if (!client.connected) {
       client.connect()
@@ -171,7 +243,6 @@ function App() {
 
     const handleConnect = () => {
       setStatus('Connected')
-      setSelfSocketId(client.id || '')
     }
     const handleDisconnect = () => setStatus('Reconnecting…')
     const handleSync = (nextValue) => {
@@ -232,8 +303,8 @@ function App() {
       // Creator ko code dikhao but typing pad nahi (wait for user to join)
       if (data && data.code) {
         setConnectionCode(data.code)
+        setInputCode(data.code)
         setStatus('Waiting for user to join...')
-        openShareDropdown()
         saveSessionMetadata(data.code, 'creator')
         if (data.participants) {
           updateParticipants(data.participants)
@@ -246,8 +317,8 @@ function App() {
       // User joined but only one user, so don't show pad yet
       if (data && data.code) {
         setConnectionCode(data.code)
+        setInputCode(data.code)
         setStatus('Waiting for another user...')
-        openShareDropdown()
         if (data.participants) {
           updateParticipants(data.participants)
         }
@@ -257,9 +328,6 @@ function App() {
       updateParticipants(payload?.participants)
     }
     const handleSelfInfo = (payload) => {
-      if (payload?.socketId) {
-        setSelfSocketId(payload.socketId)
-      }
       if (payload?.name) {
         setDisplayName(payload.name)
       }
@@ -418,6 +486,7 @@ function App() {
       setIsSavingName(false)
       if (response?.ok) {
         setDisplayName(response.name || trimmed)
+        saveDisplayName(response.name || trimmed)
         setPendingName('')
         setStatus('Name updated')
       } else {
@@ -478,7 +547,6 @@ function App() {
     setCodeBlocks(updated)
   }
 
-
   const handleCreateSession = () => {
     const client = getSocket()
     setStatus('Creating session...')
@@ -487,9 +555,10 @@ function App() {
     const handleSessionCreated = (code) => {
       if (code) {
         setConnectionCode(code)
+        setInputCode(code)
         setStatus('Waiting for another user...')
         setShowTypingPad(false)
-        openShareDropdown()
+        closeShareDropdown()
       }
       // Remove this one-time listener
       client.off('join:success', handleSessionCreated)
@@ -512,6 +581,25 @@ function App() {
         }, 100)
       })
     }
+  }
+
+  const handleRefreshConnectionCode = () => {
+    const client = getSocket()
+    if (!connectionCode) {
+      handleCreateSession()
+      return
+    }
+    setStatus('Refreshing code...')
+    closeShareDropdown()
+    setShowTypingPad(false)
+    setConnectedUsers([])
+    setConnectionCode('')
+    setInputCode('')
+    clearSessionMetadata()
+    client.emit('leave:session')
+    setTimeout(() => {
+      handleCreateSession()
+    }, 200)
   }
 
   const handleJoinSession = () => {
@@ -587,9 +675,231 @@ function App() {
     setIsDisconnecting(false)
   }
 
+  const highlightCode = useCallback((code) => {
+    try {
+      if (code.includes('function') || code.includes('const') || code.includes('let') || code.includes('var') || code.includes('=>')) {
+        return highlight(code, languages.javascript, 'javascript')
+      }
+      if (code.trim().startsWith('{') || code.trim().startsWith('[')) {
+        try {
+          JSON.parse(code)
+          return highlight(code, languages.json, 'json')
+        } catch {
+          // fall through
+        }
+      }
+      if (code.includes('{') && code.includes(':') && code.includes(';')) {
+        return highlight(code, languages.css, 'css')
+      }
+      if (code.includes('#') || code.includes('*') || (code.includes('[') && code.includes(']('))) {
+        return highlight(code, languages.markdown, 'markdown')
+      }
+      if (code.includes('<') && code.includes('>')) {
+        return highlight(code, languages.markup, 'markup')
+      }
+      return highlight(code, languages.javascript, 'javascript')
+    } catch {
+      return highlight(code, languages.plaintext, 'plaintext')
+    }
+  }, [])
+
+  const renderPadHeader = () => (
+    <header className="pad-header">
+      <div>
+        <p className="eyebrow">Shared paste pad</p>
+        <h1>Instant Text Sharing</h1>
+      </div>
+      <span className={`status-pill status-pill--${status === 'Connected' ? 'ok' : 'warn'}`}>
+        {status}
+      </span>
+    </header>
+  )
+
+  const renderConnectionPanel = () => {
+    const isHostingSession = Boolean(connectionCode && !showTypingPad)
+
+    return (
+      <div className="connection-section">
+        <p className="subtitle">
+          {isHostingSession
+            ? 'Share this connection code with your collaborator while we wait for them to join.'
+            : 'Create a new session or join an existing one using a connection code.'}
+        </p>
+        <div className="connection-actions">
+          {!connectionCode && (
+            <button className="btn btn-primary" onClick={handleCreateSession}>
+              Create New Session
+            </button>
+          )}
+
+          {isHostingSession && (
+            <div className="host-code-card">
+              <div className="host-code-label">Your connection code</div>
+              <div className="host-code-value">{connectionCode}</div>
+              <div className="host-code-actions">
+                <button className="btn btn-secondary" onClick={handleCopyCode}>
+                  Copy Code
+                </button>
+                <button className="btn btn-ghost" onClick={handleRefreshConnectionCode}>
+                  Refresh Code
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="join-section">
+            <input
+              type="text"
+              className="code-input"
+              placeholder={`Enter ${codeLength}-digit code`}
+              value={inputCode}
+              onChange={(e) => setInputCode(e.target.value.toUpperCase().slice(0, codeLength))}
+              maxLength={codeLength}
+            />
+            <button className="btn btn-secondary" onClick={handleJoinSession}>
+              Join Session
+            </button>
+          </div>
+        </div>
+       
+      </div>
+      
+    )
+  }
+
+  const renderTypingPanel = () => (
+    <>
+      <div className="code-blocks-container">
+        {codeBlocks.map((block, index) => (
+          <div key={block.id} className="code-block-wrapper">
+            <div className="code-block-header">
+              <input
+                type="text"
+                className="code-block-name-input"
+                value={block.name}
+                onChange={(e) => handleRenameBlock(block.id, e.target.value)}
+                onBlur={(e) => {
+                  if (!e.target.value.trim()) {
+                    handleRenameBlock(block.id, `Block ${block.id + 1}`)
+                  }
+                }}
+                placeholder={`Block ${index + 1}`}
+              />
+              <div className="code-block-actions">
+                <button 
+                  className="btn-copy-block" 
+                  onClick={() => handleCopyBlock(block.content)}
+                  title="Copy this block"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                  </svg>
+                </button>
+                {codeBlocks.length > 1 && (
+                  <button 
+                    className="btn-delete-block" 
+                    onClick={() => handleDeleteBlock(block.id)}
+                    title="Delete this block"
+                  >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <polyline points="3 6 5 6 21 6"></polyline>
+                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    </svg>
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="code-block-content">
+              <Editor
+                value={block.content}
+                onValueChange={(code) => handleBlockChange(block.id, code)}
+                highlight={highlightCode}
+                padding={16}
+                className="code-editor-block"
+                placeholder={`Start typing in Block ${index + 1}...`}
+                style={{
+                  fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace",
+                  fontSize: '1.05rem',
+                  lineHeight: '1.6',
+                  outline: 'none',
+                }}
+              />
+            </div>
+          </div>
+        ))}
+        
+        <button className="btn-add-block" onClick={handleAddNewBlock}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          Add New Block
+        </button>
+      </div>
+
+      <footer className="pad-footer">
+        <span>{content.length} characters</span>
+        <span className={`typing-indicator ${remoteTyping ? 'typing-indicator--active' : ''}`}>
+          {remoteTyping ? 'Someone is typing…' : 'Waiting for collaborators'}
+        </span>
+      </footer>
+    </>
+  )
+
+  const renderVideoOverlay = (label) => (
+    <div className="video-overlay" aria-live="polite">
+      {label && <span className="video-overlay-label">{label}</span>}
+      <span className="video-overlay-typing">
+        {landingTypingText}
+        <span className="video-overlay-cursor" aria-hidden="true" />
+      </span>
+    </div>
+  )
+
+  const renderLandingMedia = () => (
+    <div className="landing-media">
+      <div className="video-card video-card--primary">
+        <img
+          className="landing-video"
+          src="/vite2.png"
+          alt="Host View"
+        />
+        {renderVideoOverlay('Live typing')}
+        <div className="video-badge">Host View</div>
+      </div>
+
+      <div className="video-connector">
+        <svg
+          className="video-connector-svg"
+          viewBox="0 0 260 180"
+          xmlns="http://www.w3.org/2000/svg"
+          fill="none"
+          preserveAspectRatio="none"
+        >
+          <path className="video-connector-path" d="M10 120 L200 120 L200 170" />
+          <path className="video-connector-arrow" d="M188 150 L200 178 L212 150" />
+         
+        </svg>
+        <span className="connector-label">Connected</span>
+      </div>
+
+      <div className="video-card video-card--secondary">
+        <img
+          className="landing-video"
+          src="/vite2.png"
+          
+        />
+        {renderVideoOverlay('Guest preview')}
+        <div className="video-badge">Guest View</div>
+      </div>
+    </div>
+  )
+  
+
   return (
     <main className="app-shell">
-      {connectionCode && (
+      {connectionCode && showTypingPad && (
         <div className="share-button-container" ref={shareDropdownRef}>
           <button 
             className="btn-share" 
@@ -640,12 +950,13 @@ function App() {
                   {connectedUsers.length > 0 ? (
                     connectedUsers.map((user, index) => {
                       const socketId = user?.socketId
-                      const isSelf = socketId === selfSocketId
+                      const clientId = user?.clientId
+                      const isSelf = clientId && clientId === clientIdValue
                       const fallbackLabel = `User ${index + 1}`
                       const displayLabel = user?.name || fallbackLabel
                       return (
                         <div
-                          key={socketId || `${fallbackLabel}-${index}`}
+                          key={clientId || socketId || `${fallbackLabel}-${index}`}
                           className={`participant-pill ${isSelf ? 'participant-pill--self' : ''}`}
                         >
                           <div className="participant-name">
@@ -653,7 +964,7 @@ function App() {
                             {isSelf && <span className="participant-self-tag">You</span>}
                           </div>
                           <span className="participant-id">
-                            {formatSocketId(socketId)}
+                            {formatSocketId(socketId || clientId)}
                           </span>
                         </div>
                       )
@@ -697,159 +1008,20 @@ function App() {
         </button>
       )}
 
-      <section className="pad-card">
-        <header className="pad-header">
-          <div>
-            <p className="eyebrow">Shared paste pad</p>
-            <h1>Instant Text Sharing</h1>
-          </div>
-          <span className={`status-pill status-pill--${status === 'Connected' ? 'ok' : 'warn'}`}>
-            {status}
-          </span>
-        </header>
-
-        {!showTypingPad ? (
-          <div className="connection-section">
-            <p className="subtitle">
-              {connectionCode 
-                ? `Share this connection code with others. Waiting for someone to join...`
-                : 'Create a new session or join an existing one using a connection code.'}
-            </p>
-            <div className="connection-actions">
-              {!connectionCode ? (
-                <button className="btn btn-primary" onClick={handleCreateSession}>
-                  Create New Session
-                </button>
-              ) : (
-                <div className="code-display-inline">
-                  <p className="waiting-text">
-                    Waiting for others to join… share the code using the button in the top-right corner.
-                  </p>
-                </div>
-              )}
-              {!connectionCode && (
-                <div className="join-section">
-                  <input
-                    type="text"
-                    className="code-input"
-                    placeholder={`Enter ${codeLength}-digit code`}
-                    value={inputCode}
-                    onChange={(e) => setInputCode(e.target.value.toUpperCase().slice(0, codeLength))}
-                    maxLength={codeLength}
-                  />
-                  <button className="btn btn-secondary" onClick={handleJoinSession}>
-                    Join Session
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-        ) : (
-          <>
-            <div className="code-blocks-container">
-              {codeBlocks.map((block, index) => (
-                <div key={block.id} className="code-block-wrapper">
-                  <div className="code-block-header">
-                    <input
-                      type="text"
-                      className="code-block-name-input"
-                      value={block.name}
-                      onChange={(e) => handleRenameBlock(block.id, e.target.value)}
-                      onBlur={(e) => {
-                        if (!e.target.value.trim()) {
-                          handleRenameBlock(block.id, `Block ${block.id + 1}`)
-                        }
-                      }}
-                      placeholder={`Block ${index + 1}`}
-                    />
-                    <div className="code-block-actions">
-                      <button 
-                        className="btn-copy-block" 
-                        onClick={() => handleCopyBlock(block.content)}
-                        title="Copy this block"
-                      >
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
-                          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
-                        </svg>
-                      </button>
-                      {codeBlocks.length > 1 && (
-                        <button 
-                          className="btn-delete-block" 
-                          onClick={() => handleDeleteBlock(block.id)}
-                          title="Delete this block"
-                        >
-                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <polyline points="3 6 5 6 21 6"></polyline>
-                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                          </svg>
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  <div className="code-block-content">
-                    <Editor
-                      value={block.content}
-                      onValueChange={(code) => handleBlockChange(block.id, code)}
-                      highlight={(code) => {
-                        try {
-                          if (code.includes('function') || code.includes('const') || code.includes('let') || code.includes('var') || code.includes('=>')) {
-                            return highlight(code, languages.javascript, 'javascript')
-                          }
-                          if (code.trim().startsWith('{') || code.trim().startsWith('[')) {
-                            try {
-                              JSON.parse(code)
-                              return highlight(code, languages.json, 'json')
-                            } catch {
-                              // Not valid JSON
-                            }
-                          }
-                          if (code.includes('{') && code.includes(':') && code.includes(';')) {
-                            return highlight(code, languages.css, 'css')
-                          }
-                          if (code.includes('#') || code.includes('*') || (code.includes('[') && code.includes(']('))) {
-                            return highlight(code, languages.markdown, 'markdown')
-                          }
-                          if (code.includes('<') && code.includes('>')) {
-                            return highlight(code, languages.markup, 'markup')
-                          }
-                          return highlight(code, languages.javascript, 'javascript')
-                        } catch {
-                          return highlight(code, languages.plaintext, 'plaintext')
-                        }
-                      }}
-                      padding={16}
-                      className="code-editor-block"
-                      placeholder={`Start typing in Block ${index + 1}...`}
-                      style={{
-                        fontFamily: "'JetBrains Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace",
-                        fontSize: '1.05rem',
-                        lineHeight: '1.6',
-                        outline: 'none',
-                      }}
-                    />
-                  </div>
-                </div>
-              ))}
-              
-              <button className="btn-add-block" onClick={handleAddNewBlock}>
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="12" y1="5" x2="12" y2="19"></line>
-                  <line x1="5" y1="12" x2="19" y2="12"></line>
-                </svg>
-                Add New Block
-              </button>
-            </div>
-
-            <footer className="pad-footer">
-              <span>{content.length} characters</span>
-              <span className={`typing-indicator ${remoteTyping ? 'typing-indicator--active' : ''}`}>
-                {remoteTyping ? 'Someone is typing…' : 'Waiting for collaborators'}
-              </span>
-            </footer>
-          </>
-        )}
-      </section>
+      {!showTypingPad ? (
+        <div className="landing-shell">
+          <section className="pad-card">
+            {renderPadHeader()}
+            {renderConnectionPanel()}
+          </section>
+          {renderLandingMedia()}
+        </div>
+      ) : (
+        <section className="pad-card">
+          {renderPadHeader()}
+          {renderTypingPanel()}
+        </section>
+      )}
     </main>
   )
 }

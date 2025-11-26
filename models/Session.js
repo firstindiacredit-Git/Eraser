@@ -48,6 +48,10 @@ const sessionSchema = new mongoose.Schema(
         },
       },
     ],
+    hasGuestJoined: {
+      type: Boolean,
+      default: false,
+    },
     isActive: {
       type: Boolean,
       default: true,
@@ -115,6 +119,7 @@ sessionSchema.methods.addOrUpdateUser = function (
 
   if (this.creatorClientId === clientId) {
     this.creatorSocketId = socketId;
+    this.isActive = true;
     if (name) {
       this.creatorName = name;
     }
@@ -131,6 +136,7 @@ sessionSchema.methods.addOrUpdateUser = function (
     existingUser.name = name || existingUser.name;
     existingUser.lastSeenAt = new Date();
   } else {
+    this.hasGuestJoined = true;
     this.joinedUsers.push({
       socketId,
       clientId,
@@ -160,10 +166,15 @@ sessionSchema.methods.updateUserName = function (clientId, name = "") {
 };
 
 // Method to remove a user
-sessionSchema.methods.removeUserByClientId = function (clientId) {
-  if (!clientId) return this.save();
+sessionSchema.methods.removeUserByClientId = async function (clientId) {
+  if (!clientId) {
+    await this.save();
+    return { deleted: false, session: this };
+  }
 
-  if (this.creatorClientId === clientId) {
+  const removingCreator = this.creatorClientId === clientId;
+
+  if (removingCreator) {
     this.isActive = false;
     this.creatorName = "";
     this.creatorSocketId = "";
@@ -174,7 +185,18 @@ sessionSchema.methods.removeUserByClientId = function (clientId) {
   }
 
   this.lastActivity = new Date();
-  return this.save();
+
+  if (
+    removingCreator &&
+    !this.hasGuestJoined &&
+    this.joinedUsers.length === 0
+  ) {
+    await this.deleteOne();
+    return { deleted: true, session: null };
+  }
+
+  await this.save();
+  return { deleted: false, session: this };
 };
 
 const Session = mongoose.model("Session", sessionSchema);

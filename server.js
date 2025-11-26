@@ -380,11 +380,14 @@ io.on("connection", (socket) => {
         // Update MongoDB
         const session = await Session.findOne({ code: currentSession });
         if (session) {
-          await session.removeUserByClientId(socket.data.clientId);
-          const participants = session.getParticipants();
-          notifyRoomUsers(currentSession, "participants:update", {
-            participants,
-          });
+          const { deleted, session: updatedSession } =
+            await session.removeUserByClientId(socket.data.clientId);
+          if (!deleted && updatedSession) {
+            const participants = updatedSession.getParticipants();
+            notifyRoomUsers(currentSession, "participants:update", {
+              participants,
+            });
+          }
         }
 
         socket.leave(currentSession);
