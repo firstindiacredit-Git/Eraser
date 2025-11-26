@@ -202,6 +202,8 @@ function App() {
     setInputCode(offlineCode)
     setStatus('Offline mode: share this code once the server reconnects.')
     setShowTypingPad(false)
+    setConnectedUsers([])
+    clearSessionMetadata()
     closeShareDropdown()
   }, [closeShareDropdown, generateLocalConnectionCode])
 
@@ -619,6 +621,7 @@ function App() {
     createSessionFallbackRef.current = setTimeout(() => {
       activateOfflineSession()
       client.off('join:success', handleSessionCreated)
+      createSessionFallbackRef.current = null
     }, 3000)
     
     // Ensure we're connected before creating session
@@ -639,6 +642,10 @@ function App() {
 
   const handleRefreshConnectionCode = () => {
     const client = getSocket()
+    if (isOfflineSession) {
+      activateOfflineSession()
+      return
+    }
     if (!connectionCode) {
       handleCreateSession()
       return
@@ -657,6 +664,10 @@ function App() {
   }
 
   const handleJoinSession = () => {
+    if (isOfflineSession) {
+      setStatus('Server offline. Please wait for it to reconnect before joining.')
+      return
+    }
     joinSessionWithCode(inputCode, {
       persistRole: 'guest',
       showPadOnJoin: true,
@@ -678,6 +689,8 @@ function App() {
       client.emit('leave:session')
     }
     // Reset state
+    setIsOfflineSession(false)
+    clearCreateSessionFallback()
     setConnectionCode('')
     setInputCode('')
     setContent('')
@@ -776,7 +789,9 @@ function App() {
       <div className="connection-section">
         <p className="subtitle">
           {isHostingSession
-            ? 'Share this connection code with your collaborator while we wait for them to join.'
+            ? isOfflineSession
+              ? 'Server connection is down. Share this temporary code or try refreshing once the socket is back.'
+              : 'Share this connection code with your collaborator while we wait for them to join.'
             : 'Create a new session or join an existing one using a connection code.'}
         </p>
         <div className="connection-actions">
@@ -787,15 +802,22 @@ function App() {
           )}
 
           {isHostingSession && (
-            <div className="host-code-card">
-              <div className="host-code-label">Your connection code</div>
+            <div className={`host-code-card ${isOfflineSession ? 'host-code-card--offline' : ''}`}>
+              <div className="host-code-label">
+                {isOfflineSession ? 'Offline session code' : 'Your connection code'}
+              </div>
               <div className="host-code-value">{connectionCode}</div>
+              <div className="host-code-status">
+                {isOfflineSession
+                  ? 'Socket server unreachable. Share this placeholder or refresh when ready.'
+                  : 'Waiting for your collaborator to join.'}
+              </div>
               <div className="host-code-actions">
                 <button className="btn btn-secondary" onClick={handleCopyCode}>
                   Copy Code
                 </button>
                 <button className="btn btn-ghost" onClick={handleRefreshConnectionCode}>
-                  Refresh Code
+                  {isOfflineSession ? 'Generate new code' : 'Refresh Code'}
                 </button>
               </div>
             </div>

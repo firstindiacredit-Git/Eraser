@@ -1195,6 +1195,17 @@
   flex-wrap: wrap;
 }
 
+.host-code-card--offline {
+  border-style: dashed;
+  border-color: rgba(255, 193, 94, 0.65);
+  background: rgba(33, 26, 10, 0.85);
+}
+
+.host-code-status {
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.75);
+}
+
 .code-input {
   flex: 1;
   background: #0f111a;
