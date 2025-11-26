@@ -10,16 +10,17 @@ import 'prismjs/components/prism-markup'
 import 'prismjs/themes/prism-tomorrow.css'
 import './App.css'
 
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? 'http://localhost:4000'
-const SESSION_STORAGE_KEY = 'toolzbuy:activeSession'
-const CLIENT_ID_STORAGE_KEY = 'toolzbuy:clientId'
-const DISPLAY_NAME_STORAGE_KEY = 'toolzbuy:displayName'
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? 'https://instanttextsharing.vercel.app'
+const SESSION_STORAGE_KEY = 'instanttextsharing:activeSession'
+const CLIENT_ID_STORAGE_KEY = 'instanttextsharing:clientId'
+const DISPLAY_NAME_STORAGE_KEY = 'instanttextsharing:displayName'
 const LANDING_TYPING_PHRASES = [
   'Pair program from anywhere.',
   'Ship reviews while you call.',
   'Demo your fix in real time.',
 ]
 const FALLBACK_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+const OFFLINE_SESSION_STORAGE_KEY = 'toolzbuy:offlineSession'
 
 const generateClientId = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -93,6 +94,36 @@ const clearSessionMetadata = () => {
   storage.removeItem(SESSION_STORAGE_KEY)
 }
 
+const getOfflineSessionMetadata = () => {
+  const storage = safeLocalStorage()
+  if (!storage) return null
+  try {
+    const raw = storage.getItem(OFFLINE_SESSION_STORAGE_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+const saveOfflineSessionMetadata = (code, ownerId) => {
+  const storage = safeLocalStorage()
+  if (!storage || !code) return
+  storage.setItem(
+    OFFLINE_SESSION_STORAGE_KEY,
+    JSON.stringify({
+      code,
+      ownerId,
+      updatedAt: Date.now(),
+    })
+  )
+}
+
+const clearOfflineSessionMetadata = () => {
+  const storage = safeLocalStorage()
+  if (!storage) return
+  storage.removeItem(OFFLINE_SESSION_STORAGE_KEY)
+}
+
 let socketInstance
 
 const getSocket = () => {
@@ -136,10 +167,13 @@ function App() {
   const [isOfflineSession, setIsOfflineSession] = useState(false)
   const [clientIdValue] = useState(() => getStoredClientId())
   const clientIdRef = useRef(clientIdValue)
+  const contentRef = useRef('')
   const shareDropdownRef = useRef()
   const typingTimeoutRef = useRef()
   const localTypingRef = useRef(false)
   const createSessionFallbackRef = useRef()
+  const offlineChannelRef = useRef()
+  const offlineRoleRef = useRef('host')
   const offlineRetryIntervalRef = useRef()
   const landingVideoRefs = useRef([])
   const [landingTypingIndex, setLandingTypingIndex] = useState(0)
@@ -199,6 +233,130 @@ function App() {
     }
   }, [])
 
+  const updateBlocksFromContent = useCallback((value) => {
+    if (value) {
+      const blocks = value.split('\n\n---\n\n').filter((b) => b.trim() !== '')
+      if (blocks.length > 0) {
+        setCodeBlocks(
+          blocks.map((block, idx) => ({
+            id: idx,
+            content: block.trim(),
+            name: `Block ${idx + 1}`,
+          }))
+        )
+        return
+      }
+      setCodeBlocks([{ id: 0, content: value, name: 'Block 1' }])
+      return
+    }
+    setCodeBlocks([{ id: 0, content: '', name: 'Block 1' }])
+  }, [])
+
+  const applySyncedContent = useCallback(
+    (value) => {
+      setContent((prev) => (prev === value ? prev : value || ''))
+      updateBlocksFromContent(value)
+    },
+    [updateBlocksFromContent]
+  )
+
+  const upsertOfflineParticipant = useCallback((participant) => {
+    if (!participant?.clientId) return
+    setConnectedUsers((prev) => {
+      const filtered = prev.filter(
+        (entry) => entry?.clientId && entry.clientId !== participant.clientId
+      )
+      return [...filtered, participant]
+    })
+  }, [])
+
+  const broadcastOfflineContent = useCallback((value) => {
+    if (!offlineChannelRef.current) return
+    offlineChannelRef.current.postMessage({
+      type: 'offline:content',
+      payload: { content: value },
+      senderId: clientIdRef.current,
+    })
+  }, [])
+
+  const teardownOfflineChannel = useCallback(() => {
+    if (offlineChannelRef.current) {
+      offlineChannelRef.current.close()
+      offlineChannelRef.current = null
+    }
+  }, [])
+
+  const teardownOfflineArtifacts = useCallback(() => {
+    clearOfflineSessionMetadata()
+    teardownOfflineChannel()
+    clearOfflineRetryTimer()
+  }, [clearOfflineRetryTimer, teardownOfflineChannel])
+
+  const clearOfflineSessionState = useCallback(() => {
+    teardownOfflineArtifacts()
+    setIsOfflineSession(false)
+    setConnectedUsers([])
+  }, [teardownOfflineArtifacts])
+
+  const setupOfflineChannel = useCallback(
+    (code, role = 'host') => {
+      if (!code) return
+      if (typeof window === 'undefined' || typeof window.BroadcastChannel === 'undefined') {
+        return
+      }
+      offlineRoleRef.current = role
+      if (offlineChannelRef.current) {
+        offlineChannelRef.current.close()
+        offlineChannelRef.current = null
+      }
+      const channelName = `toolzbuy-offline-${code}`
+      const channel = new BroadcastChannel(channelName)
+      offlineChannelRef.current = channel
+
+      const announceSelf = () => {
+        const participant = {
+          clientId: clientIdRef.current,
+          name: displayName || `User ${clientIdRef.current.slice(-4)}`,
+          role,
+          offline: true,
+        }
+        upsertOfflineParticipant(participant)
+        channel.postMessage({
+          type: 'offline:participant',
+          payload: participant,
+          senderId: clientIdRef.current,
+        })
+        channel.postMessage({
+          type: 'offline:content',
+          payload: { content: contentRef.current },
+          senderId: clientIdRef.current,
+        })
+      }
+
+      channel.onmessage = (event) => {
+        const data = event?.data
+        if (!data || data.senderId === clientIdRef.current) return
+        if (data.type === 'offline:participant' && data.payload) {
+          upsertOfflineParticipant(data.payload)
+          if (offlineRoleRef.current === 'host') {
+            channel.postMessage({
+              type: 'offline:content',
+              payload: { content: contentRef.current },
+              senderId: clientIdRef.current,
+            })
+          }
+        }
+        if (data.type === 'offline:content') {
+          const incoming = data.payload?.content ?? ''
+          applySyncedContent(incoming)
+        }
+      }
+
+      announceSelf()
+    },
+    [applySyncedContent, displayName, upsertOfflineParticipant]
+  )
+
   const activateOfflineSession = useCallback(() => {
     const offlineCode = generateLocalConnectionCode()
     if (!offlineCode) {
@@ -209,11 +367,32 @@ function App() {
     setConnectionCode(offlineCode)
     setInputCode(offlineCode)
     setStatus('Offline mode: sharing placeholder while auto-retrying…')
-    setShowTypingPad(false)
+    setShowTypingPad(true)
     setConnectedUsers([])
+    saveOfflineSessionMetadata(offlineCode, clientIdRef.current)
+    setupOfflineChannel(offlineCode, 'host')
+    broadcastOfflineContent(contentRef.current)
     clearSessionMetadata()
     closeShareDropdown()
-  }, [closeShareDropdown, generateLocalConnectionCode])
+  }, [
+    broadcastOfflineContent,
+    closeShareDropdown,
+    generateLocalConnectionCode,
+    setupOfflineChannel,
+  ])
+
+  const joinOfflineSession = useCallback(
+    (code) => {
+      setIsOfflineSession(true)
+      setConnectionCode(code)
+      setInputCode(code)
+      setStatus('Offline session joined locally.')
+      setShowTypingPad(true)
+      setupOfflineChannel(code, 'guest')
+      closeShareDropdown()
+    },
+    [closeShareDropdown, setupOfflineChannel]
+  )
 
   useEffect(() => {
     if (showTypingPad) {
@@ -292,26 +471,12 @@ function App() {
     }
     const handleDisconnect = () => setStatus('Reconnecting…')
     const handleSync = (nextValue) => {
-      setContent((prev) => (prev === nextValue ? prev : nextValue))
-      // Parse content into blocks when syncing
-      if (nextValue) {
-        const blocks = nextValue.split('\n\n---\n\n').filter(b => b.trim() !== '')
-        if (blocks.length > 0) {
-          setCodeBlocks(blocks.map((block, idx) => ({ 
-            id: idx, 
-            content: block.trim(),
-            name: `Block ${idx + 1}`
-          })))
-        } else {
-          setCodeBlocks([{ id: 0, content: nextValue, name: 'Block 1' }])
-        }
-      } else {
-        setCodeBlocks([{ id: 0, content: '', name: 'Block 1' }])
-      }
+      applySyncedContent(nextValue)
     }
     const handleTyping = (flag) => setRemoteTyping(Boolean(flag))
     const handleJoinSuccess = (code) => {
       clearCreateSessionFallback()
+      teardownOfflineArtifacts()
       setIsOfflineSession(false)
       setConnectionCode(code)
       setStatus('Connected')
@@ -331,6 +496,7 @@ function App() {
       if (data && data.roomSize && data.roomSize >= 2 && data.showPad) {
         console.log('Both users connected! Showing typing pad, roomSize:', data.roomSize)
         clearCreateSessionFallback()
+        teardownOfflineArtifacts()
         setIsOfflineSession(false)
         setShowTypingPad(true)
         closeShareDropdown()
@@ -353,6 +519,7 @@ function App() {
       // Creator ko code dikhao but typing pad nahi (wait for user to join)
       if (data && data.code) {
         clearCreateSessionFallback()
+        teardownOfflineArtifacts()
         setIsOfflineSession(false)
         setConnectionCode(data.code)
         setInputCode(data.code)
@@ -369,6 +536,7 @@ function App() {
       // User joined but only one user, so don't show pad yet
       if (data && data.code) {
         clearCreateSessionFallback()
+        teardownOfflineArtifacts()
         setIsOfflineSession(false)
         setConnectionCode(data.code)
         setInputCode(data.code)
@@ -414,7 +582,7 @@ function App() {
       client.off('participants:update', handleParticipantsUpdate)
       client.off('self:info', handleSelfInfo)
     }
-  }, [updateParticipants, openShareDropdown, closeShareDropdown, clearCreateSessionFallback])
+  }, [updateParticipants, openShareDropdown, closeShareDropdown, clearCreateSessionFallback, applySyncedContent, teardownOfflineArtifacts])
 
   useEffect(() => {
     return () => {
@@ -423,8 +591,9 @@ function App() {
       }
       clearCreateSessionFallback()
       clearOfflineRetryTimer()
+      teardownOfflineChannel()
     }
-  }, [clearCreateSessionFallback, clearOfflineRetryTimer])
+  }, [clearCreateSessionFallback, clearOfflineRetryTimer, teardownOfflineChannel])
 
   useEffect(() => {
     saveDisplayName(displayName || '')
@@ -453,6 +622,10 @@ function App() {
     }, 1200)
   }
 
+  useEffect(() => {
+    contentRef.current = content
+  }, [content])
+
   const joinSessionWithCode = useCallback(
     (
       rawCode,
@@ -468,6 +641,12 @@ function App() {
         if (!silent) {
           setStatus(`Connection code must be ${codeLength} characters`)
         }
+        return
+      }
+
+      const offlineMeta = getOfflineSessionMetadata()
+      if (offlineMeta?.code === normalized) {
+        joinOfflineSession(normalized)
         return
       }
 
@@ -503,7 +682,7 @@ function App() {
         client.once('connect', emitJoin)
       }
     },
-    [codeLength, closeShareDropdown, displayName]
+    [codeLength, closeShareDropdown, displayName, joinOfflineSession]
   )
 
   useEffect(() => {
@@ -572,8 +751,12 @@ function App() {
     // Update main content by joining all blocks
     const allContent = updated.map(b => b.content).join('\n\n---\n\n')
     setContent(allContent)
-    getSocket().emit('content:update', allContent)
-    notifyTyping()
+    if (isOfflineSession) {
+      broadcastOfflineContent(allContent)
+    } else {
+      getSocket().emit('content:update', allContent)
+      notifyTyping()
+    }
   }
 
   const handleCopyBlock = (blockContent) => {
@@ -608,9 +791,10 @@ function App() {
       const { silentRetry = false } = options
       const client = getSocket()
       if (!silentRetry) {
-        setIsOfflineSession(false)
         setStatus('Creating session...')
       }
+      teardownOfflineArtifacts()
+      setIsOfflineSession(false)
       clearCreateSessionFallback()
       
       // Handler to receive the connection code
@@ -654,7 +838,7 @@ function App() {
         })
       }
     },
-    [activateOfflineSession, clearCreateSessionFallback, closeShareDropdown]
+    [activateOfflineSession, clearCreateSessionFallback, closeShareDropdown, teardownOfflineArtifacts]
   )
 
   const handleRefreshConnectionCode = () => {
@@ -681,10 +865,6 @@ function App() {
   }
 
   const handleJoinSession = () => {
-    if (isOfflineSession) {
-      setStatus('Server offline. Please wait for it to reconnect before joining.')
-      return
-    }
     joinSessionWithCode(inputCode, {
       persistRole: 'guest',
       showPadOnJoin: true,
@@ -721,9 +901,8 @@ function App() {
       client.emit('leave:session')
     }
     // Reset state
-    setIsOfflineSession(false)
     clearCreateSessionFallback()
-    clearOfflineRetryTimer()
+    clearOfflineSessionState()
     setConnectionCode('')
     setInputCode('')
     setContent('')
