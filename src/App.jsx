@@ -19,6 +19,7 @@ const LANDING_TYPING_PHRASES = [
   'Ship reviews while you call.',
   'Demo your fix in real time.',
 ]
+const FALLBACK_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
 
 const generateClientId = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -132,11 +133,13 @@ function App() {
   )
   const [isSavingName, setIsSavingName] = useState(false)
   const [isDisconnecting, setIsDisconnecting] = useState(false)
+  const [isOfflineSession, setIsOfflineSession] = useState(false)
   const [clientIdValue] = useState(() => getStoredClientId())
   const clientIdRef = useRef(clientIdValue)
   const shareDropdownRef = useRef()
   const typingTimeoutRef = useRef()
   const localTypingRef = useRef(false)
+  const createSessionFallbackRef = useRef()
   const landingVideoRefs = useRef([])
   const [landingTypingIndex, setLandingTypingIndex] = useState(0)
   const [landingTypingText, setLandingTypingText] = useState('')
@@ -168,6 +171,39 @@ function App() {
     setShowShareDropdown(false)
     setPendingName('')
   }, [])
+
+  const generateLocalConnectionCode = useCallback(() => {
+    if (!codeLength || codeLength <= 0) {
+      return ''
+    }
+    let code = ''
+    for (let i = 0; i < codeLength; i += 1) {
+      const idx = Math.floor(Math.random() * FALLBACK_CODE_CHARS.length)
+      code += FALLBACK_CODE_CHARS[idx % FALLBACK_CODE_CHARS.length]
+    }
+    return code
+  }, [codeLength])
+
+  const clearCreateSessionFallback = useCallback(() => {
+    if (createSessionFallbackRef.current) {
+      clearTimeout(createSessionFallbackRef.current)
+      createSessionFallbackRef.current = null
+    }
+  }, [])
+
+  const activateOfflineSession = useCallback(() => {
+    const offlineCode = generateLocalConnectionCode()
+    if (!offlineCode) {
+      setStatus('Unable to generate offline code. Try again.')
+      return
+    }
+    setIsOfflineSession(true)
+    setConnectionCode(offlineCode)
+    setInputCode(offlineCode)
+    setStatus('Offline mode: share this code once the server reconnects.')
+    setShowTypingPad(false)
+    closeShareDropdown()
+  }, [closeShareDropdown, generateLocalConnectionCode])
 
   useEffect(() => {
     if (showTypingPad) {
@@ -265,6 +301,8 @@ function App() {
     }
     const handleTyping = (flag) => setRemoteTyping(Boolean(flag))
     const handleJoinSuccess = (code) => {
+      clearCreateSessionFallback()
+      setIsOfflineSession(false)
       setConnectionCode(code)
       setStatus('Connected')
       // Don't hide code input yet, keep it visible
@@ -282,6 +320,8 @@ function App() {
       // Only show typing pad when BOTH users are connected (roomSize >= 2)
       if (data && data.roomSize && data.roomSize >= 2 && data.showPad) {
         console.log('Both users connected! Showing typing pad, roomSize:', data.roomSize)
+        clearCreateSessionFallback()
+        setIsOfflineSession(false)
         setShowTypingPad(true)
         closeShareDropdown()
         setStatus('Connected')
@@ -302,6 +342,8 @@ function App() {
       console.log('session:created event received:', data)
       // Creator ko code dikhao but typing pad nahi (wait for user to join)
       if (data && data.code) {
+        clearCreateSessionFallback()
+        setIsOfflineSession(false)
         setConnectionCode(data.code)
         setInputCode(data.code)
         setStatus('Waiting for user to join...')
@@ -316,6 +358,8 @@ function App() {
       console.log('waiting:for:user event received:', data)
       // User joined but only one user, so don't show pad yet
       if (data && data.code) {
+        clearCreateSessionFallback()
+        setIsOfflineSession(false)
         setConnectionCode(data.code)
         setInputCode(data.code)
         setStatus('Waiting for another user...')
@@ -360,15 +404,16 @@ function App() {
       client.off('participants:update', handleParticipantsUpdate)
       client.off('self:info', handleSelfInfo)
     }
-  }, [updateParticipants, openShareDropdown, closeShareDropdown])
+  }, [updateParticipants, openShareDropdown, closeShareDropdown, clearCreateSessionFallback])
 
   useEffect(() => {
     return () => {
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current)
       }
+      clearCreateSessionFallback()
     }
-  }, [])
+  }, [clearCreateSessionFallback])
 
   useEffect(() => {
     saveDisplayName(displayName || '')
@@ -549,10 +594,14 @@ function App() {
 
   const handleCreateSession = () => {
     const client = getSocket()
+    setIsOfflineSession(false)
     setStatus('Creating session...')
+    clearCreateSessionFallback()
     
     // Handler to receive the connection code
     const handleSessionCreated = (code) => {
+      clearCreateSessionFallback()
+      setIsOfflineSession(false)
       if (code) {
         setConnectionCode(code)
         setInputCode(code)
@@ -566,6 +615,11 @@ function App() {
     
     // Set up listener for the response
     client.once('join:success', handleSessionCreated)
+
+    createSessionFallbackRef.current = setTimeout(() => {
+      activateOfflineSession()
+      client.off('join:success', handleSessionCreated)
+    }, 3000)
     
     // Ensure we're connected before creating session
     if (client.connected) {
