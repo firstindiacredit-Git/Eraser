@@ -1049,13 +1049,13 @@ function App() {
           </div>
 
           <div className="join-iframe-wrapper">
-            <h3 className="iframe-card-title">Live AI Assistant</h3>
+            <h3 className="iframe-card-title"><span className="iframe-card-title-text">Live AI Assistant</span></h3>
             <iframe
-              src="https://lab.anam.ai/frame/L-qYmCgcppw8N0rwNjScM"
+              src="https://lab.anam.ai/frame/6UOXnTNGWyVt_nUdR_jPb"
               width="100%"
               height="200"
               allow="microphone"
-              title="AI Agent Demo"
+              title="AI Agent Assistant"
               style={{
                 border: 'none',
                 borderRadius: '16px',
@@ -1065,6 +1065,7 @@ function App() {
                 marginTop: '1px',
               }}
             />
+            
           </div>
         </div>
        

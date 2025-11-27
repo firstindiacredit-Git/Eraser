@@ -1532,3 +1532,6 @@
     width: 100%;
   }
 }
+.iframe-card-title-text {
+  margin-top: -10px;
+}
