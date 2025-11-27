@@ -23,6 +23,8 @@ const NODE_ENV = process.env.NODE_ENV ?? "production";
 const MONGODB_URI =
   process.env.MONGODB_URI ?? "mongodb://localhost:27017/toolzbuy";
 const MAX_NAME_LENGTH = 32;
+const CHUTES_API_KEY = process.env.CHUTES_API_KEY;
+const CHUTES_CHUTE_URL = process.env.CHUTES_CHUTE_URL || "https://chutes.ai/chutes/whisper-large-v3/transcribe";
 
 // Initialize Express app
 const app = express();
@@ -37,8 +39,9 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Increase body size limit for audio transcription (50MB limit)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Health check endpoint
 app.get("/health", (req, res) => {
@@ -432,6 +435,48 @@ app.get("/api/stats", async (req, res) => {
   } catch (error) {
     console.error("Error getting stats:", error);
     res.status(500).json({ error: "Failed to get stats" });
+  }
+});
+
+// API endpoint for speech-to-text transcription using Chutes
+app.post("/api/transcribe", async (req, res) => {
+  try {
+    if (!CHUTES_API_KEY) {
+      return res.status(500).json({ error: "Chutes API key not configured" });
+    }
+
+    const { audio_b64, language } = req.body;
+
+    if (!audio_b64) {
+      return res.status(400).json({ error: "audio_b64 is required" });
+    }
+
+    // Use the configured Chutes chute URL
+    const response = await fetch(CHUTES_CHUTE_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${CHUTES_API_KEY}`,
+      },
+      body: JSON.stringify({
+        audio_b64,
+        language: language || null,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("Chutes API error:", errorText);
+      return res.status(response.status).json({ 
+        error: `Transcription failed: ${errorText}` 
+      });
+    }
+
+    const result = await response.json();
+    res.json(result);
+  } catch (error) {
+    console.error("Error in transcription:", error);
+    res.status(500).json({ error: `Transcription error: ${error.message}` });
   }
 });
 

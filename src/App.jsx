@@ -10,17 +10,16 @@ import 'prismjs/components/prism-markup'
 import 'prismjs/themes/prism-tomorrow.css'
 import './App.css'
 
-const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? 'https://instanttextsharing.vercel.app'
-const SESSION_STORAGE_KEY = 'instanttextsharing:activeSession'
-const CLIENT_ID_STORAGE_KEY = 'instanttextsharing:clientId'
-const DISPLAY_NAME_STORAGE_KEY = 'instanttextsharing:displayName'
+const SOCKET_URL = import.meta.env.VITE_SOCKET_URL ?? 'http://localhost:4000'
+const SESSION_STORAGE_KEY = 'toolzbuy:activeSession'
+const CLIENT_ID_STORAGE_KEY = 'toolzbuy:clientId'
+const DISPLAY_NAME_STORAGE_KEY = 'toolzbuy:displayName'
 const LANDING_TYPING_PHRASES = [
   'Pair program from anywhere.',
   'Ship reviews while you call.',
   'Demo your fix in real time.',
 ]
 const FALLBACK_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-const OFFLINE_SESSION_STORAGE_KEY = 'toolzbuy:offlineSession'
 
 const generateClientId = () => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -94,36 +93,6 @@ const clearSessionMetadata = () => {
   storage.removeItem(SESSION_STORAGE_KEY)
 }
 
-const getOfflineSessionMetadata = () => {
-  const storage = safeLocalStorage()
-  if (!storage) return null
-  try {
-    const raw = storage.getItem(OFFLINE_SESSION_STORAGE_KEY)
-    return raw ? JSON.parse(raw) : null
-  } catch {
-    return null
-  }
-}
-
-const saveOfflineSessionMetadata = (code, ownerId) => {
-  const storage = safeLocalStorage()
-  if (!storage || !code) return
-  storage.setItem(
-    OFFLINE_SESSION_STORAGE_KEY,
-    JSON.stringify({
-      code,
-      ownerId,
-      updatedAt: Date.now(),
-    })
-  )
-}
-
-const clearOfflineSessionMetadata = () => {
-  const storage = safeLocalStorage()
-  if (!storage) return
-  storage.removeItem(OFFLINE_SESSION_STORAGE_KEY)
-}
-
 let socketInstance
 
 const getSocket = () => {
@@ -167,18 +136,20 @@ function App() {
   const [isOfflineSession, setIsOfflineSession] = useState(false)
   const [clientIdValue] = useState(() => getStoredClientId())
   const clientIdRef = useRef(clientIdValue)
-  const contentRef = useRef('')
   const shareDropdownRef = useRef()
   const typingTimeoutRef = useRef()
   const localTypingRef = useRef(false)
   const createSessionFallbackRef = useRef()
-  const offlineChannelRef = useRef()
-  const offlineRoleRef = useRef('host')
   const offlineRetryIntervalRef = useRef()
   const landingVideoRefs = useRef([])
   const [landingTypingIndex, setLandingTypingIndex] = useState(0)
   const [landingTypingText, setLandingTypingText] = useState('')
   const [isDeletingLandingText, setIsDeletingLandingText] = useState(false)
+  const [isRecording, setIsRecording] = useState(false)
+  const [isTranscribing, setIsTranscribing] = useState(false)
+  const [activeBlockId, setActiveBlockId] = useState(0)
+  const mediaRecorderRef = useRef(null)
+  const audioChunksRef = useRef([])
 
   const updateParticipants = useCallback(
     (participants) => {
@@ -233,130 +204,6 @@ function App() {
     }
   }, [])
 
-  const updateBlocksFromContent = useCallback((value) => {
-    if (value) {
-      const blocks = value.split('\n\n---\n\n').filter((b) => b.trim() !== '')
-      if (blocks.length > 0) {
-        setCodeBlocks(
-          blocks.map((block, idx) => ({
-            id: idx,
-            content: block.trim(),
-            name: `Block ${idx + 1}`,
-          }))
-        )
-        return
-      }
-      setCodeBlocks([{ id: 0, content: value, name: 'Block 1' }])
-      return
-    }
-    setCodeBlocks([{ id: 0, content: '', name: 'Block 1' }])
-  }, [])
-
-  const applySyncedContent = useCallback(
-    (value) => {
-      setContent((prev) => (prev === value ? prev : value || ''))
-      updateBlocksFromContent(value)
-    },
-    [updateBlocksFromContent]
-  )
-
-  const upsertOfflineParticipant = useCallback((participant) => {
-    if (!participant?.clientId) return
-    setConnectedUsers((prev) => {
-      const filtered = prev.filter(
-        (entry) => entry?.clientId && entry.clientId !== participant.clientId
-      )
-      return [...filtered, participant]
-    })
-  }, [])
-
-  const broadcastOfflineContent = useCallback((value) => {
-    if (!offlineChannelRef.current) return
-    offlineChannelRef.current.postMessage({
-      type: 'offline:content',
-      payload: { content: value },
-      senderId: clientIdRef.current,
-    })
-  }, [])
-
-  const teardownOfflineChannel = useCallback(() => {
-    if (offlineChannelRef.current) {
-      offlineChannelRef.current.close()
-      offlineChannelRef.current = null
-    }
-  }, [])
-
-  const teardownOfflineArtifacts = useCallback(() => {
-    clearOfflineSessionMetadata()
-    teardownOfflineChannel()
-    clearOfflineRetryTimer()
-  }, [clearOfflineRetryTimer, teardownOfflineChannel])
-
-  const clearOfflineSessionState = useCallback(() => {
-    teardownOfflineArtifacts()
-    setIsOfflineSession(false)
-    setConnectedUsers([])
-  }, [teardownOfflineArtifacts])
-
-  const setupOfflineChannel = useCallback(
-    (code, role = 'host') => {
-      if (!code) return
-      if (typeof window === 'undefined' || typeof window.BroadcastChannel === 'undefined') {
-        return
-      }
-      offlineRoleRef.current = role
-      if (offlineChannelRef.current) {
-        offlineChannelRef.current.close()
-        offlineChannelRef.current = null
-      }
-      const channelName = `toolzbuy-offline-${code}`
-      const channel = new BroadcastChannel(channelName)
-      offlineChannelRef.current = channel
-
-      const announceSelf = () => {
-        const participant = {
-          clientId: clientIdRef.current,
-          name: displayName || `User ${clientIdRef.current.slice(-4)}`,
-          role,
-          offline: true,
-        }
-        upsertOfflineParticipant(participant)
-        channel.postMessage({
-          type: 'offline:participant',
-          payload: participant,
-          senderId: clientIdRef.current,
-        })
-        channel.postMessage({
-          type: 'offline:content',
-          payload: { content: contentRef.current },
-          senderId: clientIdRef.current,
-        })
-      }
-
-      channel.onmessage = (event) => {
-        const data = event?.data
-        if (!data || data.senderId === clientIdRef.current) return
-        if (data.type === 'offline:participant' && data.payload) {
-          upsertOfflineParticipant(data.payload)
-          if (offlineRoleRef.current === 'host') {
-            channel.postMessage({
-              type: 'offline:content',
-              payload: { content: contentRef.current },
-              senderId: clientIdRef.current,
-            })
-          }
-        }
-        if (data.type === 'offline:content') {
-          const incoming = data.payload?.content ?? ''
-          applySyncedContent(incoming)
-        }
-      }
-
-      announceSelf()
-    },
-    [applySyncedContent, displayName, upsertOfflineParticipant]
-  )
-
   const activateOfflineSession = useCallback(() => {
     const offlineCode = generateLocalConnectionCode()
     if (!offlineCode) {
@@ -367,32 +214,11 @@ function App() {
     setConnectionCode(offlineCode)
     setInputCode(offlineCode)
     setStatus('Offline mode: sharing placeholder while auto-retrying…')
-    setShowTypingPad(true)
+    setShowTypingPad(false)
     setConnectedUsers([])
-    saveOfflineSessionMetadata(offlineCode, clientIdRef.current)
-    setupOfflineChannel(offlineCode, 'host')
-    broadcastOfflineContent(contentRef.current)
     clearSessionMetadata()
     closeShareDropdown()
-  }, [
-    broadcastOfflineContent,
-    closeShareDropdown,
-    generateLocalConnectionCode,
-    setupOfflineChannel,
-  ])
-
-  const joinOfflineSession = useCallback(
-    (code) => {
-      setIsOfflineSession(true)
-      setConnectionCode(code)
-      setInputCode(code)
-      setStatus('Offline session joined locally.')
-      setShowTypingPad(true)
-      setupOfflineChannel(code, 'guest')
-      closeShareDropdown()
-    },
-    [closeShareDropdown, setupOfflineChannel]
-  )
+  }, [closeShareDropdown, generateLocalConnectionCode])
 
   useEffect(() => {
     if (showTypingPad) {
@@ -471,12 +297,26 @@ function App() {
     }
     const handleDisconnect = () => setStatus('Reconnecting…')
     const handleSync = (nextValue) => {
-      applySyncedContent(nextValue)
+      setContent((prev) => (prev === nextValue ? prev : nextValue))
+      // Parse content into blocks when syncing
+      if (nextValue) {
+        const blocks = nextValue.split('\n\n---\n\n').filter(b => b.trim() !== '')
+        if (blocks.length > 0) {
+          setCodeBlocks(blocks.map((block, idx) => ({ 
+            id: idx, 
+            content: block.trim(),
+            name: `Block ${idx + 1}`
+          })))
+        } else {
+          setCodeBlocks([{ id: 0, content: nextValue, name: 'Block 1' }])
+        }
+      } else {
+        setCodeBlocks([{ id: 0, content: '', name: 'Block 1' }])
+      }
     }
     const handleTyping = (flag) => setRemoteTyping(Boolean(flag))
     const handleJoinSuccess = (code) => {
       clearCreateSessionFallback()
-      teardownOfflineArtifacts()
       setIsOfflineSession(false)
       setConnectionCode(code)
       setStatus('Connected')
@@ -496,7 +336,6 @@ function App() {
       if (data && data.roomSize && data.roomSize >= 2 && data.showPad) {
         console.log('Both users connected! Showing typing pad, roomSize:', data.roomSize)
         clearCreateSessionFallback()
-        teardownOfflineArtifacts()
         setIsOfflineSession(false)
         setShowTypingPad(true)
         closeShareDropdown()
@@ -519,7 +358,6 @@ function App() {
       // Creator ko code dikhao but typing pad nahi (wait for user to join)
       if (data && data.code) {
         clearCreateSessionFallback()
-        teardownOfflineArtifacts()
         setIsOfflineSession(false)
         setConnectionCode(data.code)
         setInputCode(data.code)
@@ -536,7 +374,6 @@ function App() {
       // User joined but only one user, so don't show pad yet
       if (data && data.code) {
         clearCreateSessionFallback()
-        teardownOfflineArtifacts()
         setIsOfflineSession(false)
         setConnectionCode(data.code)
         setInputCode(data.code)
@@ -582,7 +419,7 @@ function App() {
       client.off('participants:update', handleParticipantsUpdate)
       client.off('self:info', handleSelfInfo)
     }
-  }, [updateParticipants, openShareDropdown, closeShareDropdown, clearCreateSessionFallback, applySyncedContent, teardownOfflineArtifacts])
+  }, [updateParticipants, openShareDropdown, closeShareDropdown, clearCreateSessionFallback])
 
   useEffect(() => {
     return () => {
@@ -591,9 +428,13 @@ function App() {
       }
       clearCreateSessionFallback()
       clearOfflineRetryTimer()
-      teardownOfflineChannel()
+      // Cleanup recording on unmount
+      if (mediaRecorderRef.current && isRecording) {
+        mediaRecorderRef.current.stop()
+        setIsRecording(false)
+      }
     }
-  }, [clearCreateSessionFallback, clearOfflineRetryTimer, teardownOfflineChannel])
+  }, [clearCreateSessionFallback, clearOfflineRetryTimer, isRecording])
 
   useEffect(() => {
     saveDisplayName(displayName || '')
@@ -622,10 +463,6 @@ function App() {
     }, 1200)
   }
 
-  useEffect(() => {
-    contentRef.current = content
-  }, [content])
-
   const joinSessionWithCode = useCallback(
     (
       rawCode,
@@ -641,12 +478,6 @@ function App() {
         if (!silent) {
           setStatus(`Connection code must be ${codeLength} characters`)
         }
-        return
-      }
-
-      const offlineMeta = getOfflineSessionMetadata()
-      if (offlineMeta?.code === normalized) {
-        joinOfflineSession(normalized)
         return
       }
 
@@ -682,7 +513,7 @@ function App() {
         client.once('connect', emitJoin)
       }
     },
-    [codeLength, closeShareDropdown, displayName, joinOfflineSession]
+    [codeLength, closeShareDropdown, displayName]
   )
 
   useEffect(() => {
@@ -751,12 +582,8 @@ function App() {
     // Update main content by joining all blocks
     const allContent = updated.map(b => b.content).join('\n\n---\n\n')
     setContent(allContent)
-    if (isOfflineSession) {
-      broadcastOfflineContent(allContent)
-    } else {
-      getSocket().emit('content:update', allContent)
-      notifyTyping()
-    }
+    getSocket().emit('content:update', allContent)
+    notifyTyping()
   }
 
   const handleCopyBlock = (blockContent) => {
@@ -786,15 +613,136 @@ function App() {
     setCodeBlocks(updated)
   }
 
+  const convertAudioToBase64 = async (audioBlob) => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onloadend = () => {
+        const base64String = reader.result.split(',')[1]
+        resolve(base64String)
+      }
+      reader.onerror = reject
+      reader.readAsDataURL(audioBlob)
+    })
+  }
+
+  const transcribeAudio = async (audioBlob) => {
+    try {
+      setIsTranscribing(true)
+      setStatus('Transcribing audio...')
+      
+      const audioBase64 = await convertAudioToBase64(audioBlob)
+      
+      const response = await fetch(`${SOCKET_URL.replace('/socket.io', '')}/api/transcribe`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          audio_b64: audioBase64,
+        }),
+      })
+
+      if (!response.ok) {
+        const error = await response.json()
+        throw new Error(error.error || 'Transcription failed')
+      }
+
+      const result = await response.json()
+      
+      // Format the transcription result
+      let transcribedText = ''
+      if (Array.isArray(result)) {
+        // If result is array of chunks, combine them
+        transcribedText = result.map(chunk => chunk.text || chunk).join(' ')
+      } else if (result.text) {
+        transcribedText = result.text
+      } else if (typeof result === 'string') {
+        transcribedText = result
+      } else {
+        // Try to extract text from chunks
+        transcribedText = result.chunks?.map(chunk => chunk.text).join(' ') || JSON.stringify(result)
+      }
+
+      // Insert transcribed text into the active block
+      if (transcribedText.trim()) {
+        const activeBlock = codeBlocks.find(b => b.id === activeBlockId) || codeBlocks[0]
+        const currentContent = activeBlock.content
+        const newContent = currentContent 
+          ? `${currentContent}\n${transcribedText}` 
+          : transcribedText
+        
+        handleBlockChange(activeBlockId, newContent)
+        setStatus('Transcription complete!')
+        setTimeout(() => setStatus('Connected'), 2000)
+      } else {
+        setStatus('No text transcribed')
+        setTimeout(() => setStatus('Connected'), 2000)
+      }
+    } catch (error) {
+      console.error('Transcription error:', error)
+      setStatus(`Transcription error: ${error.message}`)
+      setTimeout(() => setStatus('Connected'), 3000)
+    } finally {
+      setIsTranscribing(false)
+    }
+  }
+
+  const startRecording = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      })
+      
+      audioChunksRef.current = []
+      
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data)
+        }
+      }
+      
+      mediaRecorder.onstop = async () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
+        stream.getTracks().forEach(track => track.stop())
+        await transcribeAudio(audioBlob)
+      }
+      
+      mediaRecorderRef.current = mediaRecorder
+      mediaRecorder.start()
+      setIsRecording(true)
+      setStatus('Recording... Click again to stop')
+    } catch (error) {
+      console.error('Error starting recording:', error)
+      setStatus('Error: Could not access microphone')
+      setTimeout(() => setStatus('Connected'), 3000)
+    }
+  }
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && isRecording) {
+      mediaRecorderRef.current.stop()
+      setIsRecording(false)
+      setStatus('Processing audio...')
+    }
+  }
+
+  const handleToggleRecording = () => {
+    if (isRecording) {
+      stopRecording()
+    } else {
+      startRecording()
+    }
+  }
+
   const handleCreateSession = useCallback(
     (options = {}) => {
       const { silentRetry = false } = options
       const client = getSocket()
       if (!silentRetry) {
+        setIsOfflineSession(false)
         setStatus('Creating session...')
       }
-      teardownOfflineArtifacts()
-      setIsOfflineSession(false)
       clearCreateSessionFallback()
       
       // Handler to receive the connection code
@@ -838,7 +786,7 @@ function App() {
         })
       }
     },
-    [activateOfflineSession, clearCreateSessionFallback, closeShareDropdown, teardownOfflineArtifacts]
+    [activateOfflineSession, clearCreateSessionFallback, closeShareDropdown]
   )
 
   const handleRefreshConnectionCode = () => {
@@ -865,6 +813,10 @@ function App() {
   }
 
   const handleJoinSession = () => {
+    if (isOfflineSession) {
+      setStatus('Server offline. Please wait for it to reconnect before joining.')
+      return
+    }
     joinSessionWithCode(inputCode, {
       persistRole: 'guest',
       showPadOnJoin: true,
@@ -901,8 +853,9 @@ function App() {
       client.emit('leave:session')
     }
     // Reset state
+    setIsOfflineSession(false)
     clearCreateSessionFallback()
-    clearOfflineSessionState()
+    clearOfflineRetryTimer()
     setConnectionCode('')
     setInputCode('')
     setContent('')
@@ -984,13 +937,59 @@ function App() {
 
   const renderPadHeader = () => (
     <header className="pad-header">
-      <div>
-        <p className="eyebrow">Shared paste pad</p>
-        <h1>Instant Text Sharing</h1>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+        <div>
+          <p className="eyebrow">Shared paste pad</p>
+          <h1>Instant Text Sharing</h1>
+        </div>
+        
       </div>
-      <span className={`status-pill status-pill--${status === 'Connected' ? 'ok' : 'warn'}`}>
-        {status}
-      </span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        {showTypingPad && (
+          <button
+            className={`btn-voice ${isRecording ? 'btn-voice--recording' : ''} ${isTranscribing ? 'btn-voice--transcribing' : ''}`}
+            onClick={handleToggleRecording}
+            disabled={isTranscribing}
+            title={isRecording ? 'Stop recording' : isTranscribing ? 'Transcribing...' : 'Start voice recording'}
+            style={{
+              padding: '8px 16px',
+              borderRadius: '8px',
+              border: 'none',
+              background: isRecording ? '#ff4444' : isTranscribing ? '#ffaa00' : '#4CAF50',
+              color: 'white',
+              cursor: isTranscribing ? 'not-allowed' : 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              fontSize: '14px',
+              fontWeight: '500',
+              transition: 'all 0.2s',
+            }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              {isRecording ? (
+                <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+              ) : isTranscribing ? (
+                <>
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <polyline points="12 6 12 12 16 14"></polyline>
+                </>
+              ) : (
+                <>
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                  <line x1="12" y1="19" x2="12" y2="23"></line>
+                  <line x1="8" y1="23" x2="16" y2="23"></line>
+                </>
+              )}
+            </svg>
+            {isRecording ? 'Stop' : isTranscribing ? 'Transcribing...' : 'Voice'}
+          </button>
+        )}
+        <span className={`status-pill status-pill--${status === 'Connected' ? 'ok' : 'warn'}`}>
+          {status}
+        </span>
+      </div>
     </header>
   )
 
@@ -1048,6 +1047,25 @@ function App() {
               Join Session
             </button>
           </div>
+
+          <div className="join-iframe-wrapper">
+            <h3 className="iframe-card-title">Live AI Assistant</h3>
+            <iframe
+              src="https://lab.anam.ai/frame/L-qYmCgcppw8N0rwNjScM"
+              width="100%"
+              height="200"
+              allow="microphone"
+              title="AI Agent Demo"
+              style={{
+                border: 'none',
+                borderRadius: '16px',
+                width: '100%',
+                minHeight: '200px',
+                boxShadow: '0 10px 30px rgba(0,0,0,0.15)',
+                marginTop: '1px',
+              }}
+            />
+          </div>
         </div>
        
       </div>
@@ -1102,6 +1120,7 @@ function App() {
               <Editor
                 value={block.content}
                 onValueChange={(code) => handleBlockChange(block.id, code)}
+                onFocus={() => setActiveBlockId(block.id)}
                 highlight={highlightCode}
                 padding={16}
                 className="code-editor-block"
@@ -1181,6 +1200,7 @@ function App() {
         {renderVideoOverlay('Guest preview')}
         <div className="video-badge">Guest View</div>
       </div>
+    
     </div>
   )
   
