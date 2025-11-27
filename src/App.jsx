@@ -1051,7 +1051,7 @@ function App() {
           <div className="join-iframe-wrapper">
             <h3 className="iframe-card-title"><span className="iframe-card-title-text">Live AI Assistant</span></h3>
             <iframe
-              src="https://lab.anam.ai/frame/6UOXnTNGWyVt_nUdR_jPb"
+              src="https://lab.anam.ai/frame/ggbkkgGJB9tAxVb-vuCgN"
               width="100%"
               height="200"
               allow="microphone"
